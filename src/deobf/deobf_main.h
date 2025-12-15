@@ -62,3 +62,6 @@ void deobf_attach_popup(TWidget *widget, TPopupMenu *popup, vdui_t *vu);
 
 // Clear tracking for a function to allow re-deobfuscation
 void chernobog_clear_function_tracking(ea_t func_ea);
+
+// Clear ALL tracking caches (called on database load if CHERNOBOG_RESET=1)
+void chernobog_clear_all_tracking();

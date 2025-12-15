@@ -130,13 +130,35 @@ static bool try_init_hexrays() {
 }
 
 //--------------------------------------------------------------------------
-// IDB event handler - to catch when hexrays becomes available
+// Check if cache reset is enabled via environment variable
+//--------------------------------------------------------------------------
+static bool is_reset_mode_enabled() {
+    qstring env;
+    if (qgetenv("CHERNOBOG_RESET", &env) && !env.empty() && env[0] != '0')
+        return true;
+    return false;
+}
+
+//--------------------------------------------------------------------------
+// IDB event handler - to catch when hexrays becomes available and db loads
 //--------------------------------------------------------------------------
 static ssize_t idaapi idb_callback(void *, int event_id, va_list) {
     // Try to init hexrays on various events
     if (!s_hexrays_initialized) {
         try_init_hexrays();
     }
+
+    // Clear hexrays decompiler cache when database is opened (if CHERNOBOG_RESET=1)
+    // This forces full redecompilation of all functions
+    if (event_id == idb_event::closebase) {
+        if (is_reset_mode_enabled() && s_hexrays_initialized) {
+            s_auto_deobfuscated.clear();
+            chernobog_clear_all_tracking();
+            clear_cached_cfuncs();
+            msg("[chernobog] Cleared Hex-Rays decompiler cache (CHERNOBOG_RESET=1)\n");
+        }
+    }
+
     return 0;
 }
 

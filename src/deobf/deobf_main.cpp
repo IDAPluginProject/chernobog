@@ -48,6 +48,14 @@ void chernobog_clear_function_tracking(ea_t func_ea) {
     deflatten_handler_t::clear_deferred(func_ea);
 }
 
+// Clear ALL tracking caches (called on database load if CHERNOBOG_RESET=1)
+void chernobog_clear_all_tracking() {
+    s_processed_functions.clear();
+    s_optblock_processed.clear();
+    deflatten_handler_t::s_deferred_analysis.clear();
+    msg("[chernobog] Cleared all deobfuscation caches\n");
+}
+
 //--------------------------------------------------------------------------
 // Block-level optimizer callback - runs at various maturity levels
 //--------------------------------------------------------------------------
