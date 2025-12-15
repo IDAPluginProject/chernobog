@@ -59,3 +59,6 @@ bool deobf_active();
 void deobf_init();
 void deobf_done();
 void deobf_attach_popup(TWidget *widget, TPopupMenu *popup, vdui_t *vu);
+
+// Clear tracking for a function to allow re-deobfuscation
+void chernobog_clear_function_tracking(ea_t func_ea);

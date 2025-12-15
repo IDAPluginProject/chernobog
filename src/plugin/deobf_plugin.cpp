@@ -67,6 +67,16 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
         // Attach all component actions
         component_registry_t::attach_to_popup(widget, popup, vu);
     }
+    // Clear tracking when view is refreshed (e.g., after inlining)
+    // This allows re-deobfuscation when user makes changes
+    else if (event == hxe_refresh_pseudocode) {
+        vdui_t *vu = va_arg(va, vdui_t *);
+        if (vu && vu->cfunc) {
+            ea_t func_ea = vu->cfunc->entry_ea;
+            s_auto_deobfuscated.erase(func_ea);
+            chernobog_clear_function_tracking(func_ea);
+        }
+    }
     // Auto-deobfuscate at microcode stage for analysis
     // Note: CFG modifications at maturity 0 are risky
     else if (event == hxe_microcode) {

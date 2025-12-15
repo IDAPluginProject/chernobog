@@ -31,6 +31,23 @@ static chernobog_optblock_t *g_optblock = nullptr;
 // Track functions we've already processed to avoid duplicate analysis
 static std::set<ea_t> s_processed_functions;
 
+// Track optblock processed combinations (cleared on refresh)
+static std::set<uint64_t> s_optblock_processed;
+
+// Clear tracking for a function to allow re-deobfuscation
+void chernobog_clear_function_tracking(ea_t func_ea) {
+    s_processed_functions.erase(func_ea);
+
+    // Clear all maturity combinations for this function from optblock tracking
+    for (int m = 0; m < 16; m++) {
+        uint64_t key = ((uint64_t)func_ea << 4) | m;
+        s_optblock_processed.erase(key);
+    }
+
+    // Also clear deferred analysis
+    deflatten_handler_t::clear_deferred(func_ea);
+}
+
 //--------------------------------------------------------------------------
 // Block-level optimizer callback - runs at various maturity levels
 //--------------------------------------------------------------------------
@@ -57,12 +74,12 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
 
     // Track which function+maturity combinations we've processed to avoid duplicate work
     // Key: (func_ea << 4) | maturity (assuming maturity < 16)
-    static std::set<uint64_t> processed;
+    // Uses global set that can be cleared to allow re-deobfuscation
     uint64_t key = ((uint64_t)func_ea << 4) | (maturity & 0xF);
 
-    if (processed.count(key))
+    if (s_optblock_processed.count(key))
         return 0;
-    processed.insert(key);
+    s_optblock_processed.insert(key);
 
     msg("[optblock] Processing %a at maturity %d (blk %d)\n", func_ea, maturity, blk->serial);
 
@@ -556,6 +573,9 @@ struct deobf_action_handler_t : public action_handler_t {
     deobf_action_handler_t(int (*f)(vdui_t *)) : action_func(f) {}
 
     virtual int idaapi activate(action_activation_ctx_t *ctx) override {
+        // Check if hexrays is available before using its API
+        if (!get_hexdsp())
+            return 0;
         vdui_t *vu = get_widget_vdui(ctx->widget);
         if (vu)
             return action_func(vu);
@@ -563,6 +583,9 @@ struct deobf_action_handler_t : public action_handler_t {
     }
 
     virtual action_state_t idaapi update(action_update_ctx_t *ctx) override {
+        // Check if hexrays is available before using its API
+        if (!get_hexdsp())
+            return AST_DISABLE_FOR_WIDGET;
         if (!ctx || !ctx->widget)
             return AST_DISABLE_FOR_WIDGET;
         vdui_t *vu = get_widget_vdui(ctx->widget);
