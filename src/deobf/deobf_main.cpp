@@ -62,9 +62,6 @@ void chernobog_clear_all_tracking() {
 // Block-level optimizer callback - runs at various maturity levels
 //--------------------------------------------------------------------------
 int idaapi chernobog_optblock_t::func(mblock_t *blk) {
-    // TEMPORARILY DISABLED - debugging crash
-    return 0;
-
     // Debug: log every call to see if we're being invoked
     if (!blk || !blk->mba) {
         msg("[optblock] Called with null blk or mba\n");
@@ -192,8 +189,17 @@ int idaapi chernobog_t::func(mblock_t *blk, minsn_t *ins, int optflags) {
 // Main deobfuscation entry point - from mba (used by auto mode)
 //--------------------------------------------------------------------------
 void chernobog_t::deobfuscate_mba(mbl_array_t *mba) {
-    // TEMPORARILY DISABLED - debugging crash
-    return;
+    if (!mba)
+        return;
+
+    deobf::log("[chernobog] Deobfuscating %a (from mba)\n", mba->entry_ea);
+
+    s_ctx = deobf_ctx_t();
+    s_ctx.mba = mba;
+    s_ctx.func_ea = mba->entry_ea;
+
+    // Run the core deobfuscation logic
+    run_deobfuscation_passes(mba, &s_ctx);
 }
 
 //--------------------------------------------------------------------------
