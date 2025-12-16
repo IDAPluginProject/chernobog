@@ -1,9 +1,12 @@
 #include "identity_call.h"
 #include "../analysis/pattern_match.h"
+#include <allins.hpp>  // For NN_mov, NN_jmp, etc.
 
 // Static members
 std::set<ea_t> identity_call_handler_t::s_identity_funcs;
 std::set<ea_t> identity_call_handler_t::s_non_identity_funcs;
+std::map<ea_t, ea_t> identity_call_handler_t::s_trampoline_cache;
+std::map<ea_t, std::vector<deferred_identity_call_t>> identity_call_handler_t::s_deferred_analysis;
 
 //--------------------------------------------------------------------------
 // Detection
@@ -12,35 +15,64 @@ bool identity_call_handler_t::detect(mbl_array_t *mba) {
     if (!mba)
         return false;
 
-    // Look for calls followed by indirect calls through the result
+    // Scan all blocks for calls to identity functions and for ijmp.
+    // If we find both (identity call somewhere + ijmp somewhere), we have the pattern.
+
+    bool found_identity_call = false;
+    bool found_ijmp = false;
+    ea_t identity_func_addr = BADADDR;
+
+    // Helper lambda to extract call target from instruction
+    auto get_call_target = [](minsn_t *ins) -> ea_t {
+        ea_t target = BADADDR;
+
+        // Direct m_call
+        if (ins->opcode == m_call) {
+            if (ins->l.t == mop_v)
+                target = ins->l.g;
+            else if (ins->l.t == mop_a && ins->l.a && ins->l.a->t == mop_v)
+                target = ins->l.a->g;
+        }
+        // m_mov with nested call (mov call(...) => temp)
+        else if (ins->opcode == m_mov && ins->l.t == mop_d && ins->l.d) {
+            minsn_t *sub = ins->l.d;
+            if (sub->opcode == m_call) {
+                if (sub->l.t == mop_v)
+                    target = sub->l.g;
+                else if (sub->l.t == mop_a && sub->l.a && sub->l.a->t == mop_v)
+                    target = sub->l.a->g;
+            }
+        }
+        return target;
+    };
+
+    // Scan all blocks
     for (int i = 0; i < mba->qty; i++) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if (!blk || !blk->head)
             continue;
 
         for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-            // Look for call instructions
-            if (ins->opcode == m_call) {
-                // Check if the call target is a known or potential identity function
-                if (ins->l.t == mop_v || ins->l.t == mop_a) {
-                    ea_t target = BADADDR;
-                    if (ins->l.t == mop_v) {
-                        target = ins->l.g;
-                    } else if (ins->l.t == mop_a && ins->l.a && ins->l.a->t == mop_v) {
-                        target = ins->l.a->g;
-                    }
-                    if (is_identity_function(target)) {
-                        return true;
-                    }
-                }
+            // Check for ijmp
+            if (ins->opcode == m_ijmp) {
+                found_ijmp = true;
             }
 
-            // Look for icall (indirect call) through a register that was
-            // just loaded from a call result
-            if (ins->opcode == m_icall) {
-                return true;  // Potential pattern
+            // Check for call to identity function
+            ea_t target = get_call_target(ins);
+            if (target != BADADDR) {
+                if (is_identity_function(target)) {
+                    found_identity_call = true;
+                    identity_func_addr = target;
+                    deobf::log("[identity_call] detect: %a is identity function\n", target);
+                }
             }
         }
+    }
+
+    if (found_identity_call && found_ijmp) {
+        deobf::log("[identity_call] Detected pattern: identity call to %a + ijmp\n", identity_func_addr);
+        return true;
     }
 
     return false;
@@ -50,6 +82,9 @@ bool identity_call_handler_t::detect(mbl_array_t *mba) {
 // Check if a function is an identity function
 //--------------------------------------------------------------------------
 bool identity_call_handler_t::is_identity_function(ea_t func_ea) {
+    if (func_ea == BADADDR)
+        return false;
+
     // Check cache first
     if (s_identity_funcs.count(func_ea))
         return true;
@@ -68,40 +103,25 @@ bool identity_call_handler_t::is_identity_function(ea_t func_ea) {
 
 //--------------------------------------------------------------------------
 // Analyze if a function is an identity function
+// Identity function: just returns its first argument
+// Pattern: mov rax, rdi; ret (or equivalent)
 //--------------------------------------------------------------------------
 bool identity_call_handler_t::analyze_identity_func(ea_t ea) {
     func_t *func = get_func(ea);
     if (!func)
         return false;
 
-    // Identity functions are typically very short
+    // Identity functions are typically very short (< 32 bytes)
     if (func->end_ea - func->start_ea > 32)
         return false;
 
-    // Get function name for heuristics
-    qstring name;
-    get_func_name(&name, ea);
-
-    // Decompile and check if it's just "return a1"
-    hexrays_failure_t hf;
-    cfuncptr_t cfunc = decompile(func, &hf, DECOMP_NO_WAIT);
-    if (!cfunc)
-        return false;
-
-    // Check the function body - should be trivial
-    citem_t *body = cfunc->body.find_parent_of(nullptr);
-    if (!body)
-        return false;
-
-    // For an identity function, we expect:
-    // - Single return statement
-    // - Return value is the first argument
-
-    // Alternative: Check at assembly level
-    // Look for: mov rax, rdi; ret  (or similar)
+    // Analyze at assembly level
+    // Look for: mov rax, rdi; ret (or similar)
     ea_t curr = func->start_ea;
     insn_t insn;
     int insn_count = 0;
+    bool saw_mov_rax_rdi = false;
+    bool saw_ret = false;
 
     while (curr < func->end_ea && insn_count < 10) {
         if (decode_insn(&insn, curr) == 0)
@@ -109,84 +129,283 @@ bool identity_call_handler_t::analyze_identity_func(ea_t ea) {
 
         insn_count++;
 
-        // Skip nops (for most architectures, check if instruction does nothing)
-        // This is a simplified check - proper NOP detection would be arch-specific
+        // Skip nops
         if (insn.size == 1 && get_byte(insn.ea) == 0x90) {
             curr = insn.ea + insn.size;
             continue;
         }
 
-        // Check for mov rax, rdi (or equivalent first arg -> return reg)
-        // On x64: rdi is first arg, rax is return
-        // On ARM64: x0 is both first arg and return
+        // Check for "mov rax, rdi" (x64)
+        if (insn.itype == NN_mov) {
+            if (insn.Op1.type == o_reg && insn.Op1.reg == 0 &&  // rax
+                insn.Op2.type == o_reg && insn.Op2.reg == 7) {   // rdi
+                saw_mov_rax_rdi = true;
+            }
+        }
 
-        // If we hit a ret early, check if we've seen the right pattern
+        // Check for ret
         if (is_ret_insn(insn)) {
-            // If the function is just "ret" or "mov rax, rdi; ret"
-            // it's likely an identity function
-            if (insn_count <= 3) {
-                return true;
+            saw_ret = true;
+            break;
+        }
+
+        // If we see a call, check if it's to another identity function
+        if (is_call_insn(insn)) {
+            ea_t call_target = get_first_fcref_from(insn.ea);
+            if (call_target != BADADDR && call_target != ea) {
+                if (!s_non_identity_funcs.count(call_target)) {
+                    s_non_identity_funcs.insert(ea);
+                    if (is_identity_function(call_target)) {
+                        saw_mov_rax_rdi = true;
+                    }
+                    s_non_identity_funcs.erase(ea);
+                }
             }
         }
 
         curr = insn.ea + insn.size;
     }
 
-    // Very short function that doesn't call anything is suspicious
-    if (insn_count <= 5) {
-        // Check if function has no calls
-        bool has_call = false;
-        curr = func->start_ea;
-        while (curr < func->end_ea) {
-            if (decode_insn(&insn, curr) == 0)
-                break;
-            if (is_call_insn(insn)) {
-                has_call = true;
-                break;
-            }
-            curr = insn.ea + insn.size;
-        }
+    // Very short function with return - check pattern
+    if (insn_count <= 5 && saw_ret) {
+        if (saw_mov_rax_rdi)
+            return true;
 
-        if (!has_call) {
-            return true;  // Short function with no calls - likely identity
-        }
+        // Trivial function that just returns
+        if (insn_count <= 3)
+            return true;
     }
 
     return false;
 }
 
 //--------------------------------------------------------------------------
-// Main deobfuscation pass
+// Phase 1: Main deobfuscation pass - analyze and store for annotation
+// NOTE: We do NOT patch bytes during decompilation - that causes INTERR.
+// Instead, we store analysis results and apply annotations in Phase 2.
 //--------------------------------------------------------------------------
 int identity_call_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     if (!mba || !ctx)
         return 0;
 
-    deobf::log("[identity_call] Starting identity call resolution\n");
+    deobf::log("[identity_call] Analyzing identity call patterns\n");
 
-    int total_changes = 0;
+    ea_t func_ea = mba->entry_ea;
 
     // Find all identity call patterns
     auto identity_calls = find_identity_calls(mba, ctx);
     deobf::log("[identity_call] Found %zu identity call patterns\n", identity_calls.size());
 
+    if (identity_calls.empty())
+        return 0;
+
+    std::vector<deferred_identity_call_t> deferred;
+
     for (const auto &ic : identity_calls) {
-        mblock_t *blk = mba->get_mblock(ic.block_idx);
-        if (!blk)
-            continue;
+        qstring target_name;
+        if (get_func_name(&target_name, ic.final_target) <= 0) {
+            target_name.sprnt("sub_%a", ic.final_target);
+        }
 
-        int changes = replace_identity_call(mba, blk, ic, ctx);
-        total_changes += changes;
+        // Store for Phase 2 (annotations and potential microcode modification)
+        deferred_identity_call_t dc;
+        dc.call_ea = ic.call_ea;
+        dc.ijmp_ea = ic.ijmp_ea;
+        dc.identity_func = ic.identity_func;
+        dc.global_ptr = ic.global_ptr;
+        dc.final_target = ic.final_target;
+        dc.target_name = target_name;
+        dc.is_ijmp_pattern = ic.is_ijmp_pattern;
+        deferred.push_back(dc);
 
-        if (changes > 0) {
-            ctx->indirect_resolved++;
-            deobf::log("[identity_call] Resolved call at block %d: %a -> %a\n",
-                      ic.block_idx, ic.global_ptr, ic.resolved_target);
+        deobf::log("[identity_call] Analyzed: call@%a -> %s (%a)\n",
+                  ic.call_ea, target_name.c_str(), ic.final_target);
+
+        // Add annotation immediately (this is safe during decompilation)
+        qstring comment;
+        comment.sprnt("RESOLVED: -> %s (%a)", target_name.c_str(), ic.final_target);
+        set_cmt(ic.call_ea, comment.c_str(), false);
+
+        // Rename the global pointer to make decompiled code more readable
+        qstring ptr_name;
+        ptr_name.sprnt("ptr_%s", target_name.c_str());
+        set_name(ic.global_ptr, ptr_name.c_str(), SN_NOWARN | SN_NOCHECK);
+
+        // Set the function type for the resolved target if not already set
+        // This helps the decompiler understand the target's signature
+        // Check if a function exists at this address; if not, try to create one
+        func_t *target_func = get_func(ic.final_target);
+        if (!target_func) {
+            // No function at this address - try to create one
+            if (add_func(ic.final_target)) {
+                target_func = get_func(ic.final_target);
+                deobf::log_verbose("[identity_call] Created function at %a\n", ic.final_target);
+            }
+        }
+
+        if (target_func) {
+            tinfo_t current_type;
+            bool has_type = get_tinfo(&current_type, ic.final_target);
+            if (!has_type || current_type.empty()) {
+                // Set a default type: __int64 __fastcall()
+                // This indicates the function takes no arguments and returns int64
+                const char *type_str = "__int64 __fastcall f();";
+                tinfo_t func_type;
+                qstring parsed_name;
+                if (parse_decl(&func_type, &parsed_name, nullptr, type_str, PT_SIL)) {
+                    apply_tinfo(ic.final_target, func_type, TINFO_DEFINITE);
+                    deobf::log_verbose("[identity_call] Set type for %a\n", ic.final_target);
+                }
+            }
+        }
+
+        ctx->indirect_resolved++;
+    }
+
+    // Store for Phase 2
+    if (!deferred.empty()) {
+        s_deferred_analysis[func_ea] = std::move(deferred);
+    }
+
+    deobf::log("[identity_call] Analyzed %zu patterns\n", identity_calls.size());
+
+    return (int)identity_calls.size();
+}
+
+//--------------------------------------------------------------------------
+// Phase 2: Apply deferred transformations at MMAT_LOCOPT
+// At this maturity, we attempt microcode-level modifications to replace
+// the identity call pattern with a direct call/jump.
+//--------------------------------------------------------------------------
+int identity_call_handler_t::apply_deferred(mbl_array_t *mba, deobf_ctx_t *ctx) {
+    if (!mba || !ctx)
+        return 0;
+
+    ea_t func_ea = mba->entry_ea;
+
+    auto it = s_deferred_analysis.find(func_ea);
+    if (it == s_deferred_analysis.end())
+        return 0;
+
+    deobf::log("[identity_call] Phase 2: Processing %zu patterns at maturity %d\n",
+              it->second.size(), mba->maturity);
+
+    int changes = 0;
+
+    // At MMAT_LOCOPT (maturity 3), we can try microcode modifications
+    // but we need to be very careful to maintain CFG consistency
+    for (const auto &dc : it->second) {
+        // For now, just log the pattern - microcode modification is risky
+        // The annotations from Phase 1 already help the user understand the code
+        deobf::log("[identity_call] Pattern: %a -> %s (annotations applied)\n",
+                  dc.call_ea, dc.target_name.c_str());
+
+        // Try to find and modify the call instruction in microcode
+        // This is safer than patching x86 bytes during decompilation
+        for (int i = 0; i < mba->qty; i++) {
+            mblock_t *blk = mba->get_mblock(i);
+            if (!blk || !blk->head)
+                continue;
+
+            for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+                // Look for the identity call by EA
+                if (ins->ea != dc.call_ea)
+                    continue;
+
+                // Found the instruction at our target EA
+                // Check if it's a call or mov containing a call
+                minsn_t *call_ins = nullptr;
+
+                if (ins->opcode == m_call) {
+                    call_ins = ins;
+                } else if (ins->opcode == m_mov && ins->l.t == mop_d && ins->l.d &&
+                          ins->l.d->opcode == m_call) {
+                    call_ins = ins->l.d;
+                }
+
+                if (call_ins && call_ins->l.t == mop_v &&
+                    call_ins->l.g == dc.identity_func) {
+                    // Change the call target from identity_func to final_target
+                    deobf::log("[identity_call] Redirecting call: %a -> %a\n",
+                              call_ins->l.g, dc.final_target);
+
+                    call_ins->l.g = dc.final_target;
+
+                    // Update mcallinfo to reflect the new target
+                    if (call_ins->d.t == mop_f && call_ins->d.f) {
+                        mcallinfo_t *ci = call_ins->d.f;
+                        ci->args.clear();
+                        ci->solid_args = 0;
+                        ci->callee = dc.final_target;
+                    }
+
+                    changes++;
+
+                    // Now find the ijmp and convert it to m_nop
+                    // This is the safest transformation - just remove the ijmp
+                    // The call result becomes unused, which is fine for tail calls
+                    for (int j = 0; j < mba->qty; j++) {
+                        mblock_t *blk2 = mba->get_mblock(j);
+                        if (!blk2 || !blk2->tail)
+                            continue;
+
+                        minsn_t *tail = blk2->tail;
+                        if (tail->opcode == m_ijmp && tail->ea == dc.ijmp_ea) {
+                            deobf::log("[identity_call] Found ijmp in block %d, converting to nop\n", j);
+
+                            // Convert ijmp to nop - simplest safe transformation
+                            tail->opcode = m_nop;
+                            tail->l.erase();
+                            tail->r.erase();
+                            tail->d.erase();
+
+                            changes++;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    deobf::log("[identity_call] Resolved %d identity calls\n", total_changes);
-    return total_changes;
+    // Clear the deferred analysis after processing
+    s_deferred_analysis.erase(it);
+
+    deobf::log("[identity_call] Phase 2 complete: %d modifications\n", changes);
+    return changes;
+}
+
+//--------------------------------------------------------------------------
+// Check if we have pending analysis
+//--------------------------------------------------------------------------
+bool identity_call_handler_t::has_pending_analysis(ea_t func_ea) {
+    auto it = s_deferred_analysis.find(func_ea);
+    return it != s_deferred_analysis.end() && !it->second.empty();
+}
+
+//--------------------------------------------------------------------------
+// Clear deferred analysis for a function
+//--------------------------------------------------------------------------
+void identity_call_handler_t::clear_deferred(ea_t func_ea) {
+    s_deferred_analysis.erase(func_ea);
+}
+
+//--------------------------------------------------------------------------
+// Helper: Check if address is valid global pointer
+//--------------------------------------------------------------------------
+static bool is_valid_global_ptr(ea_t addr, ea_t exclude_target) {
+    if (addr == BADADDR || addr == exclude_target)
+        return false;
+    // Must be in a data segment with valid pointer to code
+    segment_t *seg = getseg(addr);
+    if (!seg || (seg->perm & SEGPERM_EXEC))
+        return false;  // Skip code segments
+    // Read the pointer and check it points to code
+    uint64_t val = 0;
+    if (get_bytes(&val, 8, addr) != 8)
+        return false;
+    segment_t *target_seg = getseg((ea_t)val);
+    return target_seg && (target_seg->perm & SEGPERM_EXEC);
 }
 
 //--------------------------------------------------------------------------
@@ -194,83 +413,209 @@ int identity_call_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 //--------------------------------------------------------------------------
 std::vector<identity_call_handler_t::identity_call_t>
 identity_call_handler_t::find_identity_calls(mbl_array_t *mba, deobf_ctx_t *ctx) {
-
     std::vector<identity_call_t> result;
 
-    for (int i = 0; i < mba->qty; i++) {
-        mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
-            continue;
+    // Helper struct to hold call info
+    struct call_info_t {
+        minsn_t *call_ins;
+        minsn_t *container_ins;
+        ea_t target;
+        ea_t global_ptr;
+        ea_t call_ea;
+    };
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-            // Look for call to potential identity function with global argument
-            if (ins->opcode == m_call) {
-                ea_t call_target = BADADDR;
+    // Helper lambda to extract call info
+    auto get_call_info = [](minsn_t *ins) -> call_info_t {
+        call_info_t info = {nullptr, nullptr, BADADDR, BADADDR, BADADDR};
 
-                // Get call target
-                if (ins->l.t == mop_v) {
-                    call_target = ins->l.g;
-                } else if (ins->l.t == mop_a && ins->l.a && ins->l.a->t == mop_v) {
-                    call_target = ins->l.a->g;
-                }
+        // Direct m_call
+        if (ins->opcode == m_call) {
+            info.call_ins = ins;
+            info.container_ins = ins;
+            info.call_ea = ins->ea;
 
-                if (call_target == BADADDR)
-                    continue;
+            if (ins->l.t == mop_v) {
+                info.target = ins->l.g;
+            } else if (ins->l.t == mop_a && ins->l.a && ins->l.a->t == mop_v) {
+                info.target = ins->l.a->g;
+            }
 
-                // Check if this is an identity function
-                if (!is_identity_function(call_target))
-                    continue;
+            // Try to get argument from mcallinfo
+            if (ins->d.t == mop_f && ins->d.f && !ins->d.f->args.empty()) {
+                const mcallarg_t &arg0 = ins->d.f->args[0];
+                if (arg0.t == mop_v)
+                    info.global_ptr = arg0.g;
+                else if (arg0.t == mop_a && arg0.a && arg0.a->t == mop_v)
+                    info.global_ptr = arg0.a->g;
+            }
 
-                // Check the argument - should be a global pointer
-                // The argument is typically in ins->d (call arguments) or preceding instructions
-                ea_t global_ptr = BADADDR;
+            // At early maturity, search x86 instructions for argument
+            if (info.global_ptr == BADADDR && ins->ea != BADADDR) {
+                ea_t search_ea = ins->ea;
+                insn_t asm_ins;
+                int search_count = 0;
+                while (search_count++ < 20 && search_ea > 0) {
+                    ea_t prev_ea = get_item_head(search_ea - 1);
+                    if (prev_ea == BADADDR || prev_ea >= search_ea)
+                        break;
+                    search_ea = prev_ea;
 
-                // Look at the instruction's operands for a global reference
-                // In microcode, call arguments are typically in preceding mov/push instructions
-                // or the call instruction itself may reference them
+                    if (decode_insn(&asm_ins, search_ea) == 0)
+                        break;
 
-                // Search backwards for the argument setup
-                for (minsn_t *prev = ins->prev; prev && prev != blk->head->prev; prev = prev->prev) {
-                    // Look for load from global
-                    if (prev->opcode == m_mov || prev->opcode == m_ldx) {
-                        if (prev->l.t == mop_v) {
-                            // Global variable
-                            global_ptr = prev->l.g;
-                            break;
-                        } else if (prev->l.t == mop_a && prev->l.a && prev->l.a->t == mop_v) {
-                            // Address of global
-                            global_ptr = prev->l.a->g;
+                    // Look for mov rdi, [mem]
+                    if (asm_ins.itype == NN_mov &&
+                        asm_ins.Op1.type == o_reg && asm_ins.Op1.reg == 7 &&
+                        asm_ins.Op2.type == o_mem) {
+                        ea_t ptr = asm_ins.Op2.addr;
+                        if (is_valid_global_ptr(ptr, info.target)) {
+                            info.global_ptr = ptr;
                             break;
                         }
                     }
                 }
+            }
+        }
+        // m_mov with nested call
+        else if (ins->opcode == m_mov && ins->l.t == mop_d && ins->l.d) {
+            minsn_t *sub = ins->l.d;
+            if (sub->opcode == m_call) {
+                info.call_ins = sub;
+                info.container_ins = ins;
+                info.call_ea = ins->ea;
 
-                if (global_ptr == BADADDR) {
-                    // Try checking the call's first argument directly
-                    if (ins->d.t == mop_v) {
-                        global_ptr = ins->d.g;
-                    } else if (ins->d.t == mop_a && ins->d.a && ins->d.a->t == mop_v) {
-                        global_ptr = ins->d.a->g;
-                    }
+                if (sub->l.t == mop_v) {
+                    info.target = sub->l.g;
+                } else if (sub->l.t == mop_a && sub->l.a && sub->l.a->t == mop_v) {
+                    info.target = sub->l.a->g;
                 }
 
-                if (global_ptr == BADADDR)
-                    continue;
+                // Try mcallinfo
+                if (sub->d.t == mop_f && sub->d.f && !sub->d.f->args.empty()) {
+                    const mcallarg_t &arg0 = sub->d.f->args[0];
+                    if (arg0.t == mop_v)
+                        info.global_ptr = arg0.g;
+                }
 
-                // Resolve the actual target from the global pointer
-                ea_t resolved = resolve_global_pointer(global_ptr);
-                if (resolved == BADADDR)
-                    continue;
+                // Search x86 instructions
+                if (info.global_ptr == BADADDR && ins->ea != BADADDR) {
+                    ea_t search_ea = ins->ea;
+                    insn_t asm_ins;
+                    int search_count = 0;
+                    while (search_count++ < 20 && search_ea > 0) {
+                        ea_t prev_ea = get_item_head(search_ea - 1);
+                        if (prev_ea == BADADDR || prev_ea >= search_ea)
+                            break;
+                        search_ea = prev_ea;
 
-                identity_call_t ic;
-                ic.block_idx = i;
-                ic.call_insn = ins;
-                ic.identity_func = call_target;
-                ic.global_ptr = global_ptr;
-                ic.resolved_target = resolved;
+                        if (decode_insn(&asm_ins, search_ea) == 0)
+                            break;
 
-                result.push_back(ic);
+                        if (asm_ins.itype == NN_mov &&
+                            asm_ins.Op1.type == o_reg && asm_ins.Op1.reg == 7 &&
+                            asm_ins.Op2.type == o_mem) {
+                            ea_t ptr = asm_ins.Op2.addr;
+                            if (is_valid_global_ptr(ptr, info.target)) {
+                                info.global_ptr = ptr;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+        }
+        return info;
+    };
+
+    // First pass: collect all call instructions and ijmp instructions
+    std::vector<std::pair<int, call_info_t>> calls;
+    std::vector<std::pair<int, minsn_t*>> ijmps;
+
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t *blk = mba->get_mblock(i);
+        if (!blk || !blk->head)
+            continue;
+
+        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+            if (ins->opcode == m_ijmp) {
+                ijmps.push_back({i, ins});
+            }
+
+            call_info_t cinfo = get_call_info(ins);
+            if (cinfo.target != BADADDR) {
+                calls.push_back({i, cinfo});
+            }
+        }
+    }
+
+    deobf::log_verbose("[identity_call] find: found %zu calls, %zu ijmps\n",
+                      calls.size(), ijmps.size());
+
+    // Match calls to identity functions with ijmps
+    for (const auto &call_pair : calls) {
+        int call_blk = call_pair.first;
+        const call_info_t &cinfo = call_pair.second;
+
+        if (!is_identity_function(cinfo.target))
+            continue;
+
+        deobf::log_verbose("[identity_call] find: identity call to %a in block %d, arg=%a\n",
+                          cinfo.target, call_blk, cinfo.global_ptr);
+
+        // Find matching ijmp
+        for (const auto &ijmp_pair : ijmps) {
+            int ijmp_blk = ijmp_pair.first;
+            minsn_t *ijmp_ins = ijmp_pair.second;
+
+            // Check if ijmp is related to call
+            bool is_match = false;
+            if (ijmp_blk == call_blk) {
+                for (minsn_t *p = cinfo.container_ins->next; p; p = p->next) {
+                    if (p == ijmp_ins) {
+                        is_match = true;
+                        break;
+                    }
+                }
+            } else {
+                // At early maturity, accept any ijmp
+                is_match = true;
+            }
+
+            if (!is_match)
+                continue;
+
+            if (cinfo.global_ptr == BADADDR) {
+                deobf::log_verbose("[identity_call] find: pattern found but no global ptr\n");
+                continue;
+            }
+
+            // Resolve the pointer
+            ea_t resolved = resolve_global_pointer(cinfo.global_ptr);
+            if (resolved == BADADDR) {
+                deobf::log_verbose("[identity_call] find: failed to resolve ptr %a\n", cinfo.global_ptr);
+                continue;
+            }
+
+            // Follow trampoline chain
+            ea_t final_target = resolve_trampoline_chain(resolved);
+
+            identity_call_t ic;
+            ic.block_idx = ijmp_blk;
+            ic.call_insn = cinfo.container_ins;
+            ic.ijmp_insn = ijmp_ins;
+            ic.identity_func = cinfo.target;
+            ic.global_ptr = cinfo.global_ptr;
+            ic.resolved_target = resolved;
+            ic.final_target = final_target;
+            ic.call_ea = cinfo.call_ea;
+            ic.ijmp_ea = ijmp_ins->ea;
+            ic.is_ijmp_pattern = true;
+
+            deobf::log("[identity_call] find: pattern matched: call@%a -> ptr=%a -> %a -> final %a\n",
+                      cinfo.call_ea, cinfo.global_ptr, resolved, final_target);
+
+            result.push_back(ic);
+            break;
         }
     }
 
@@ -281,30 +626,25 @@ identity_call_handler_t::find_identity_calls(mbl_array_t *mba, deobf_ctx_t *ctx)
 // Resolve global pointer to get actual target
 //--------------------------------------------------------------------------
 ea_t identity_call_handler_t::resolve_global_pointer(ea_t ptr_addr) {
-    // Read the pointer value from the global
-    ea_t target = BADADDR;
-
-    // Determine pointer size based on segment
-    segment_t *seg = getseg(ptr_addr);
-    if (!seg)
+    if (ptr_addr == BADADDR)
         return BADADDR;
 
-    // Read 8 bytes for 64-bit or 4 bytes for 32-bit
+    ea_t target = BADADDR;
     int ptr_size = (inf_is_64bit()) ? 8 : 4;
 
     if (ptr_size == 8) {
-        uint64_t val;
+        uint64_t val = 0;
         if (get_bytes(&val, 8, ptr_addr) == 8) {
             target = (ea_t)val;
         }
     } else {
-        uint32_t val;
+        uint32_t val = 0;
         if (get_bytes(&val, 4, ptr_addr) == 4) {
             target = (ea_t)val;
         }
     }
 
-    // Validate that the target is in a code segment
+    // Validate target is in code
     if (target != BADADDR) {
         segment_t *target_seg = getseg(target);
         if (target_seg && (target_seg->perm & SEGPERM_EXEC)) {
@@ -316,62 +656,250 @@ ea_t identity_call_handler_t::resolve_global_pointer(ea_t ptr_addr) {
 }
 
 //--------------------------------------------------------------------------
-// Replace identity call with direct call
+// Check if a code location is a trampoline
 //--------------------------------------------------------------------------
-int identity_call_handler_t::replace_identity_call(mbl_array_t *mba, mblock_t *blk,
-                                                    const identity_call_t &ic, deobf_ctx_t *ctx) {
-    if (!blk || !ic.call_insn)
+bool identity_call_handler_t::is_trampoline_code(ea_t addr, ea_t *next_ptr_out) {
+    if (addr == BADADDR)
+        return false;
+
+    insn_t insn;
+    ea_t curr = addr;
+    int insn_count = 0;
+
+    ea_t potential_ptr = BADADDR;
+    bool saw_identity_call = false;
+    bool saw_jmp_rax = false;
+
+    while (insn_count < 30) {
+        if (decode_insn(&insn, curr) == 0)
+            break;
+
+        insn_count++;
+
+        // Look for mov rdi, [ptr]
+        if (insn.itype == NN_mov) {
+            if (insn.Op1.type == o_reg && insn.Op1.reg == 7) {
+                if (insn.Op2.type == o_mem) {
+                    potential_ptr = insn.Op2.addr;
+                }
+            }
+        }
+
+        // Look for call to identity function
+        if (is_call_insn(insn)) {
+            ea_t call_target = get_first_fcref_from(insn.ea);
+            if (call_target != BADADDR && is_identity_function(call_target)) {
+                saw_identity_call = true;
+            } else {
+                qstring fname;
+                if (call_target != BADADDR && get_func_name(&fname, call_target) > 0) {
+                    if (fname.find("HikariFunctionWrapper") != qstring::npos) {
+                        saw_identity_call = true;
+                    }
+                }
+            }
+        }
+
+        // Look for jmp rax
+        if (insn.itype == NN_jmpni || insn.itype == NN_jmp) {
+            if (insn.Op1.type == o_reg && insn.Op1.reg == 0) {
+                saw_jmp_rax = true;
+                break;
+            }
+        }
+
+        if (is_ret_insn(insn)) {
+            break;
+        }
+
+        curr = insn.ea + insn.size;
+    }
+
+    if (saw_identity_call && saw_jmp_rax && potential_ptr != BADADDR) {
+        if (next_ptr_out)
+            *next_ptr_out = potential_ptr;
+        return true;
+    }
+
+    return false;
+}
+
+//--------------------------------------------------------------------------
+// Resolve trampoline chain recursively
+//--------------------------------------------------------------------------
+ea_t identity_call_handler_t::resolve_trampoline_chain(ea_t start_addr, int max_depth) {
+    if (start_addr == BADADDR || max_depth <= 0)
+        return start_addr;
+
+    // Check cache
+    auto it = s_trampoline_cache.find(start_addr);
+    if (it != s_trampoline_cache.end()) {
+        return it->second;
+    }
+
+    ea_t current = start_addr;
+    std::set<ea_t> visited;
+
+    while (max_depth-- > 0) {
+        if (visited.count(current)) {
+            deobf::log_verbose("[identity_call] Cycle detected at %a\n", current);
+            break;
+        }
+        visited.insert(current);
+
+        ea_t next_ptr = BADADDR;
+        if (is_trampoline_code(current, &next_ptr)) {
+            ea_t next_target = resolve_global_pointer(next_ptr);
+            if (next_target == BADADDR) {
+                deobf::log_verbose("[identity_call] Chain broken at %a\n", current);
+                break;
+            }
+
+            deobf::log_verbose("[identity_call] Chain: %a -> ptr %a -> %a\n",
+                              current, next_ptr, next_target);
+
+            current = next_target;
+        } else {
+            break;
+        }
+    }
+
+    s_trampoline_cache[start_addr] = current;
+    return current;
+}
+
+//--------------------------------------------------------------------------
+// Transform identity call by patching x86 instructions
+// This approach patches the actual binary instructions in IDA's database,
+// which is more reliable than microcode manipulation.
+//
+// Transform: call identity(ptr); jmp rax  ->  call target; nop...
+// Or:        call identity(ptr); jmp rax  ->  jmp target (if no return needed)
+//--------------------------------------------------------------------------
+int identity_call_handler_t::transform_identity_call(mbl_array_t *mba,
+    const deferred_identity_call_t &dc, deobf_ctx_t *ctx) {
+
+    (void)mba;
+    (void)ctx;
+
+    ea_t target = dc.final_target;
+    if (target == BADADDR)
         return 0;
 
-    minsn_t *call_ins = ic.call_insn;
+    // Decode the original instructions
+    insn_t call_insn, jmp_insn;
+    if (decode_insn(&call_insn, dc.call_ea) == 0)
+        return 0;
+    if (decode_insn(&jmp_insn, dc.ijmp_ea) == 0)
+        return 0;
 
-    // Look for the subsequent icall that uses the result
-    // Pattern: call identity_func -> mov result to reg -> icall through reg
-    minsn_t *icall_ins = nullptr;
+    // Verify we have the expected pattern
+    if (!is_call_insn(call_insn)) {
+        deobf::log("[identity_call] Expected call at %a\n", dc.call_ea);
+        return 0;
+    }
 
-    // The icall might be in the same block or next instructions
-    for (minsn_t *next = call_ins->next; next; next = next->next) {
-        if (next->opcode == m_icall) {
-            icall_ins = next;
-            break;
-        }
-        // Also check for m_call with indirect operand
-        if (next->opcode == m_call && next->l.t == mop_r) {
-            icall_ins = next;
+    // Check if jmp rax (indirect jump via register)
+    bool is_jmp_rax = (jmp_insn.itype == NN_jmpni || jmp_insn.itype == NN_jmp) &&
+                      jmp_insn.Op1.type == o_reg && jmp_insn.Op1.reg == 0;
+
+    if (!is_jmp_rax) {
+        deobf::log("[identity_call] Expected jmp rax at %a, got type %d\n",
+                  dc.ijmp_ea, jmp_insn.itype);
+        return 0;
+    }
+
+    // Calculate instruction sizes
+    size_t call_size = call_insn.size;
+    size_t jmp_size = jmp_insn.size;
+    size_t total_size = (dc.ijmp_ea + jmp_size) - dc.call_ea;
+
+    deobf::log("[identity_call] Patching %zu bytes at %a: call(%zu) + jmp(%zu)\n",
+              total_size, dc.call_ea, call_size, jmp_size);
+
+    // Strategy: Replace with "jmp target" (direct jump)
+    // E9 xx xx xx xx (5-byte near jump)
+    // If we have more space, pad with NOPs
+
+    // Calculate relative offset for jmp
+    ea_t jmp_end = dc.call_ea + 5;  // After the 5-byte jmp instruction
+    int32_t rel_offset = (int32_t)(target - jmp_end);
+
+    // Build the patch: E9 <rel32>
+    uint8_t patch[16];
+    patch[0] = 0xE9;  // JMP rel32
+    patch[1] = (uint8_t)(rel_offset & 0xFF);
+    patch[2] = (uint8_t)((rel_offset >> 8) & 0xFF);
+    patch[3] = (uint8_t)((rel_offset >> 16) & 0xFF);
+    patch[4] = (uint8_t)((rel_offset >> 24) & 0xFF);
+
+    // Fill rest with NOPs (0x90)
+    for (size_t i = 5; i < total_size && i < sizeof(patch); i++) {
+        patch[i] = 0x90;
+    }
+
+    // Apply the patch
+    bool patched = true;
+    for (size_t i = 0; i < total_size && i < sizeof(patch); i++) {
+        if (!patch_byte(dc.call_ea + i, patch[i])) {
+            patched = false;
             break;
         }
     }
 
-    if (icall_ins) {
-        // Replace the indirect call with direct call to resolved target
-        // Convert icall to call with direct target
+    if (!patched) {
+        deobf::log("[identity_call] Failed to patch bytes at %a\n", dc.call_ea);
 
-        // Modify the instruction
-        icall_ins->opcode = m_call;
-        icall_ins->l.t = mop_v;
-        icall_ins->l.g = ic.resolved_target;
-        icall_ins->l.size = 0;  // Code address
-
-        // NOP out the identity function call
-        call_ins->opcode = m_nop;
-
-        // Mark block as modified
-        blk->mark_lists_dirty();
-
-        deobf::log_verbose("[identity_call] Replaced icall with direct call to %a\n",
-                          ic.resolved_target);
-
-        // Add comment
+        // Fallback to annotations
         qstring comment;
-        comment.sprnt("Resolved: identity(%a) -> %a", ic.global_ptr, ic.resolved_target);
-        set_cmt(mba->entry_ea, comment.c_str(), false);
+        comment.sprnt("TRAMPOLINE -> %s (%a)", dc.target_name.c_str(), target);
+        set_cmt(dc.call_ea, comment.c_str(), false);
 
-        return 1;
+        qstring ptr_name;
+        ptr_name.sprnt("ptr_%s", dc.target_name.c_str());
+        set_name(dc.global_ptr, ptr_name.c_str(), SN_NOWARN | SN_NOCHECK);
+
+        return 0;
     }
 
-    // Alternative: The result might be returned and called elsewhere
-    // In this case, just annotate for now
-    deobf::log_verbose("[identity_call] Found identity call but no subsequent icall\n");
+    // Force IDA to re-analyze the patched area
+    del_items(dc.call_ea, DELIT_EXPAND, total_size);
+    auto_make_code(dc.call_ea);
+    auto_wait();
 
-    return 0;
+    // Add cross-reference to target
+    add_cref(dc.call_ea, target, fl_JN);
+
+    // Add comment
+    qstring comment;
+    comment.sprnt("Deobfuscated: jmp %s", dc.target_name.c_str());
+    set_cmt(dc.call_ea, comment.c_str(), false);
+
+    // Rename the global pointer
+    qstring ptr_name;
+    ptr_name.sprnt("ptr_%s", dc.target_name.c_str());
+    set_name(dc.global_ptr, ptr_name.c_str(), SN_NOWARN | SN_NOCHECK);
+
+    deobf::log("[identity_call] Patched to direct jmp to %s (%a)\n",
+              dc.target_name.c_str(), target);
+
+    return 1;
+}
+
+//--------------------------------------------------------------------------
+// Create a proper call instruction (helper for future use)
+//--------------------------------------------------------------------------
+minsn_t *identity_call_handler_t::create_call_insn(mbl_array_t *mba, ea_t target, ea_t source_ea) {
+    // Allocate a new instruction from the mba
+    minsn_t *call = new minsn_t(source_ea);
+    call->opcode = m_call;
+    call->l.t = mop_v;
+    call->l.g = target;
+    call->l.size = 0;
+
+    // For a proper call, we'd also set up:
+    // - call->d with mcallinfo (calling convention, arguments, return type)
+    // This is complex and depends on the target function's prototype
+
+    return call;
 }

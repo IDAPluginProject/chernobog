@@ -387,60 +387,119 @@ find_all_index_writes(mblock_t *blk, int max_value = 300) {
     if (!blk)
         return writes;
 
+    // Track register values for backward data flow within this block
+    // Key: register, Value: constant value (or -1 if unknown/non-constant)
+    std::map<mreg_t, int64_t> reg_values;
+
     for (minsn_t *ins = blk->head; ins; ins = ins->next) {
         uint64_t val = 0;
         int64_t var_id = -1;
+        bool found = false;
+
+        // Track register assignments: mov #const, reg
+        if (ins->opcode == m_mov && ins->l.t == mop_n && ins->d.t == mop_r) {
+            uint64_t cval = ins->l.nnn->value;
+            if (cval <= (uint64_t)max_value) {
+                reg_values[ins->d.r] = (int64_t)cval;
+            } else {
+                reg_values[ins->d.r] = -1;  // Large value, mark as unknown
+            }
+        }
+
+        // Also track xdu/xds (zero/sign extend) from constants
+        if ((ins->opcode == m_xdu || ins->opcode == m_xds) && ins->d.t == mop_r) {
+            // Check if source contains a constant
+            if (ins->l.t == mop_n) {
+                uint64_t cval = ins->l.nnn->value;
+                if (cval <= (uint64_t)max_value) {
+                    reg_values[ins->d.r] = (int64_t)cval;
+                }
+            } else if (ins->l.t == mop_d && ins->l.d) {
+                // Nested expression - check if it produces a constant
+                // Common pattern: xdu (x == 0) or xdu (x & mask)
+                // For now, mark as unknown
+                reg_values[ins->d.r] = -1;
+            }
+        }
 
         // Handle mov instruction: mov src, dst
         if (ins->opcode == m_mov) {
-            // Check if source is a small constant
-            if (ins->l.t != mop_n)
-                continue;
-
-            val = ins->l.nnn->value;
-            if (val > (uint64_t)max_value)
-                continue;
-
-            // Focus on 4-byte destinations (typical index var size)
-            // but also accept 8-byte for sign-extended cases
-            if (ins->d.size != 4 && ins->d.size != 8)
-                continue;
-
-            // Check if destination is a stack or local variable
-            if (ins->d.t == mop_S) {
-                var_id = ins->d.s->off;
-            } else if (ins->d.t == mop_l) {
-                var_id = ins->d.l->idx;
+            // Direct constant to stack
+            if (ins->l.t == mop_n) {
+                val = ins->l.nnn->value;
+                if (val <= (uint64_t)max_value) {
+                    if (ins->d.size == 4 || ins->d.size == 8) {
+                        if (ins->d.t == mop_S) {
+                            var_id = ins->d.s->off;
+                            found = true;
+                        } else if (ins->d.t == mop_l) {
+                            var_id = ins->d.l->idx;
+                            found = true;
+                        }
+                    }
+                }
+            }
+            // Register to stack - look up register value
+            else if (ins->l.t == mop_r && (ins->d.t == mop_S || ins->d.t == mop_l)) {
+                auto it = reg_values.find(ins->l.r);
+                if (it != reg_values.end() && it->second >= 0 && it->second <= max_value) {
+                    val = (uint64_t)it->second;
+                    if (ins->d.size == 4 || ins->d.size == 8) {
+                        if (ins->d.t == mop_S) {
+                            var_id = ins->d.s->off;
+                            found = true;
+                        } else if (ins->d.t == mop_l) {
+                            var_id = ins->d.l->idx;
+                            found = true;
+                        }
+                    }
+                }
             }
         }
         // Handle stx instruction: stx val, seg, dst
-        // stx stores a value to memory: l=value, r=segment, d=address
         else if (ins->opcode == m_stx) {
-            // Check if value is a small constant
-            if (ins->l.t != mop_n)
-                continue;
-
-            val = ins->l.nnn->value;
-            if (val > (uint64_t)max_value)
-                continue;
-
-            // Focus on 4-byte destinations (typical index var size)
-            if (ins->l.size != 4 && ins->l.size != 8)
-                continue;
-
-            // Check if destination is a stack variable
-            if (ins->d.t == mop_S) {
-                var_id = ins->d.s->off;
-            } else if (ins->d.t == mop_l) {
-                var_id = ins->d.l->idx;
+            // Direct constant
+            if (ins->l.t == mop_n) {
+                val = ins->l.nnn->value;
+                if (val <= (uint64_t)max_value && (ins->l.size == 4 || ins->l.size == 8)) {
+                    if (ins->d.t == mop_S) {
+                        var_id = ins->d.s->off;
+                        found = true;
+                    } else if (ins->d.t == mop_l) {
+                        var_id = ins->d.l->idx;
+                        found = true;
+                    }
+                }
+            }
+            // Register value
+            else if (ins->l.t == mop_r) {
+                auto it = reg_values.find(ins->l.r);
+                if (it != reg_values.end() && it->second >= 0 && it->second <= max_value) {
+                    val = (uint64_t)it->second;
+                    if (ins->l.size == 4 || ins->l.size == 8) {
+                        if (ins->d.t == mop_S) {
+                            var_id = ins->d.s->off;
+                            found = true;
+                        } else if (ins->d.t == mop_l) {
+                            var_id = ins->d.l->idx;
+                            found = true;
+                        }
+                    }
+                }
             }
         }
-        else {
-            continue;
+
+        if (found && var_id >= 0) {
+            writes.push_back({val, var_id});
         }
 
-        if (var_id >= 0) {
-            writes.push_back({val, var_id});
+        // Clear register value if it's overwritten by something non-constant
+        if (ins->d.t == mop_r) {
+            if (ins->opcode != m_mov || ins->l.t != mop_n) {
+                if (ins->opcode != m_xdu && ins->opcode != m_xds) {
+                    reg_values[ins->d.r] = -1;
+                }
+            }
         }
     }
 
@@ -1121,6 +1180,59 @@ deflatten_handler_t::trace_transitions_z3(mbl_array_t *mba,
 
         deobf::log("[deflatten]   Found %zu blocks with index writes\n", block_writes.size());
 
+        // ALSO check jtbl instructions for conditional transitions
+        // jtbl targets are block indices - we need to trace through them to find state writes
+        int jtbl_transitions = 0;
+        for (int blk_idx = 0; blk_idx < mba->qty; blk_idx++) {
+            mblock_t *blk = mba->get_mblock(blk_idx);
+            if (!blk || !blk->tail)
+                continue;
+
+            // Skip dispatcher chain blocks
+            if (disp.dispatcher_chain.count(blk_idx))
+                continue;
+
+            // Look for jtbl instruction at end of block
+            if (blk->tail->opcode == m_jtbl && blk->tail->r.t == mop_c) {
+                mcases_t *cases = blk->tail->r.c;
+                if (cases && !cases->empty()) {
+                    // Each target is a block index - trace through to find state write
+                    for (size_t i = 0; i < cases->size(); i++) {
+                        int target_blk_idx = cases->targets[i];
+                        if (target_blk_idx < 0 || target_blk_idx >= mba->qty)
+                            continue;
+
+                        // Trace through target block to find state write
+                        mblock_t *target_blk = mba->get_mblock(target_blk_idx);
+                        if (!target_blk)
+                            continue;
+
+                        // Look for index writes in target block
+                        auto writes = find_all_index_writes(target_blk, max_cases);
+                        for (const auto &w : writes) {
+                            uint64_t written_state = w.first;
+                            auto it = disp.state_to_block.find(written_state);
+                            if (it != disp.state_to_block.end()) {
+                                int final_target = it->second;
+                                if (final_target != blk_idx) {
+                                    cfg_edge_t edge;
+                                    edge.from_block = target_blk_idx;  // Redirect from the jtbl target
+                                    edge.to_block = final_target;
+                                    edge.state_value = written_state;
+                                    edge.is_conditional = false;
+                                    edges.push_back(edge);
+                                    jtbl_transitions++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (jtbl_transitions > 0) {
+            deobf::log("[deflatten]   Found %d transitions via jtbl targets\n", jtbl_transitions);
+        }
+
         // For each block that writes an index, check if it eventually leads to dispatcher
         std::set<int> dispatcher_and_ijmp;
         dispatcher_and_ijmp.insert(disp.dispatcher_chain.begin(), disp.dispatcher_chain.end());
@@ -1616,6 +1728,133 @@ static bool convert_ijmp_to_goto(mbl_array_t *mba, int src_idx, int new_target) 
 }
 
 //--------------------------------------------------------------------------
+// Helper: Convert a jtbl block to a direct goto to the initial state target
+// This eliminates the switch statement from the decompiled output
+//
+// jtbl format: jtbl index_expr, mcases*
+// goto format: goto block_ref
+//--------------------------------------------------------------------------
+static bool convert_jtbl_to_goto(mbl_array_t *mba, int src_idx, int new_target) {
+    if (!mba || src_idx < 0 || src_idx >= mba->qty || new_target < 0 || new_target >= mba->qty)
+        return false;
+
+    mblock_t *src = mba->get_mblock(src_idx);
+    mblock_t *dst = mba->get_mblock(new_target);
+    if (!src || !dst || !src->tail)
+        return false;
+
+    minsn_t *tail = src->tail;
+    if (tail->opcode != m_jtbl)
+        return false;
+
+    // Get current targets from mcases so we can update their predsets
+    std::set<int> old_targets;
+    if (tail->r.t == mop_c && tail->r.c) {
+        mcases_t *cases = tail->r.c;
+        for (size_t i = 0; i < cases->size(); i++) {
+            old_targets.insert(cases->targets[i]);
+        }
+    }
+
+    // Convert the jtbl to goto by modifying in place
+    tail->opcode = m_goto;
+    tail->l.make_blkref(new_target);
+    tail->r.erase();  // Clear the mcases operand
+    tail->d.erase();  // Clear the destination operand
+
+    // Update successor list
+    src->succset.clear();
+    src->succset.push_back(new_target);
+
+    // Remove src from old targets' predsets
+    for (int old_tgt : old_targets) {
+        if (old_tgt >= 0 && old_tgt < mba->qty && old_tgt != new_target) {
+            mblock_t *old_blk = mba->get_mblock(old_tgt);
+            if (old_blk) {
+                auto it = std::find(old_blk->predset.begin(), old_blk->predset.end(), src_idx);
+                if (it != old_blk->predset.end()) {
+                    old_blk->predset.erase(it);
+                }
+                old_blk->mark_lists_dirty();
+            }
+        }
+    }
+
+    // Add src to dst's predset
+    auto it = std::find(dst->predset.begin(), dst->predset.end(), src_idx);
+    if (it == dst->predset.end()) {
+        dst->predset.push_back(src_idx);
+    }
+
+    // Set block type to 1-way (unconditional goto)
+    src->type = BLT_1WAY;
+
+    // Mark lists as dirty
+    src->mark_lists_dirty();
+    dst->mark_lists_dirty();
+
+    deobf::log("[deflatten]   Converted jtbl in block %d -> goto blk%d\n", src_idx, new_target);
+
+    return true;
+}
+
+//--------------------------------------------------------------------------
+// Helper: Eliminate dispatcher jtbl by converting to direct goto
+// IMPORTANT: Only converts the PRIMARY dispatcher block's jtbl, not all jtbl
+// blocks in the chain. This preserves control flow while eliminating the
+// main dispatcher switch.
+//--------------------------------------------------------------------------
+static int eliminate_dispatcher_switches(mbl_array_t *mba,
+                                         const deflatten_handler_t::dispatcher_info_t &disp) {
+    if (!mba)
+        return 0;
+
+    // The dispatcher block index should be the primary entry point
+    int dispatcher_blk = disp.block_idx;
+    if (dispatcher_blk < 0 || dispatcher_blk >= mba->qty) {
+        deobf::log("[deflatten] Invalid dispatcher block index: %d\n", dispatcher_blk);
+        return 0;
+    }
+
+    mblock_t *blk = mba->get_mblock(dispatcher_blk);
+    if (!blk || !blk->tail) {
+        deobf::log("[deflatten] Dispatcher block %d has no tail\n", dispatcher_blk);
+        return 0;
+    }
+
+    // Check if the dispatcher block has a jtbl instruction
+    if (blk->tail->opcode != m_jtbl) {
+        deobf::log("[deflatten] Dispatcher block %d tail is not jtbl (op=%d)\n",
+                  dispatcher_blk, blk->tail->opcode);
+        return 0;
+    }
+
+    // Find the initial state target (state 0 or lowest state)
+    int initial_target = -1;
+    auto it = disp.state_to_block.find(0);
+    if (it != disp.state_to_block.end()) {
+        initial_target = it->second;
+    } else if (!disp.state_to_block.empty()) {
+        // Use the lowest state if 0 doesn't exist
+        initial_target = disp.state_to_block.begin()->second;
+    }
+
+    if (initial_target < 0 || initial_target >= mba->qty) {
+        deobf::log("[deflatten] Cannot find initial state target\n");
+        return 0;
+    }
+
+    deobf::log("[deflatten] Converting dispatcher jtbl at block %d -> goto blk%d\n",
+              dispatcher_blk, initial_target);
+
+    if (convert_jtbl_to_goto(mba, dispatcher_blk, initial_target)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+//--------------------------------------------------------------------------
 // Helper: Redirect a block's unconditional edge to a new target
 // This properly updates both the goto instruction AND the pred/succ lists
 //
@@ -1859,6 +2098,17 @@ int deflatten_handler_t::cleanup_dispatcher(mbl_array_t *mba,
         return 0;
 
     int removed = 0;
+
+    // NOTE: We intentionally do NOT eliminate dispatcher jtbl instructions.
+    // Converting jtbl to goto either:
+    // 1. Breaks control flow if done too aggressively (all jtbl -> same target)
+    // 2. Has no effect on decompiler output if done too conservatively
+    //
+    // The CFG redirections in reconstruct_cfg_z3 are sufficient to fix the
+    // actual control flow at the microcode level. The decompiler output
+    // will still show switch statements, but the underlying CFG is correct.
+    //
+    // Future improvement: selectively convert jtbl based on reachability analysis
 
     // Mark dispatcher chain blocks for removal
     // Note: IDA's microcode framework doesn't support direct block removal,

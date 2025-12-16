@@ -102,6 +102,24 @@ public:
     // Check if a value is a Hikari-style state constant
     static bool is_state_constant(uint64_t val);
 
+    //----------------------------------------------------------------------
+    // Dispatcher info - supports multiple/nested dispatchers
+    // (Public for use by helper functions)
+    //----------------------------------------------------------------------
+    struct dispatcher_info_t {
+        int block_idx;              // Block containing the switch/dispatcher
+        z3_solver::symbolic_var_t state_var;  // State variable for THIS dispatcher
+        int parent_dispatcher;      // Parent dispatcher index (-1 if root)
+        int nesting_level;          // 0 = root, 1 = nested, etc.
+        std::set<int> case_blocks;  // Blocks belonging to this dispatcher
+        std::map<uint64_t, int> state_to_block;  // State -> target block
+        std::set<int> dispatcher_chain;  // All blocks that form the dispatcher
+        bool is_solved;             // True if successfully analyzed
+
+        dispatcher_info_t() : block_idx(-1), parent_dispatcher(-1),
+                             nesting_level(0), is_solved(false) {}
+    };
+
 private:
     //----------------------------------------------------------------------
     // CFG Edge - represents an edge in the recovered control flow graph
@@ -116,23 +134,6 @@ private:
 
         cfg_edge_t() : from_block(-1), to_block(-1), is_conditional(false),
                       is_true_branch(false), state_value(0) {}
-    };
-
-    //----------------------------------------------------------------------
-    // Dispatcher info - supports multiple/nested dispatchers
-    //----------------------------------------------------------------------
-    struct dispatcher_info_t {
-        int block_idx;              // Block containing the switch/dispatcher
-        z3_solver::symbolic_var_t state_var;  // State variable for THIS dispatcher
-        int parent_dispatcher;      // Parent dispatcher index (-1 if root)
-        int nesting_level;          // 0 = root, 1 = nested, etc.
-        std::set<int> case_blocks;  // Blocks belonging to this dispatcher
-        std::map<uint64_t, int> state_to_block;  // State -> target block
-        std::set<int> dispatcher_chain;  // All blocks that form the dispatcher
-        bool is_solved;             // True if successfully analyzed
-
-        dispatcher_info_t() : block_idx(-1), parent_dispatcher(-1),
-                             nesting_level(0), is_solved(false) {}
     };
 
     //----------------------------------------------------------------------

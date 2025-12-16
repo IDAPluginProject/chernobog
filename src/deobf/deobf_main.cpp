@@ -44,8 +44,9 @@ void chernobog_clear_function_tracking(ea_t func_ea) {
         s_optblock_processed.erase(key);
     }
 
-    // Also clear deferred analysis
+    // Clear deferred analysis for all handlers
     deflatten_handler_t::clear_deferred(func_ea);
+    identity_call_handler_t::clear_deferred(func_ea);
 }
 
 // Clear ALL tracking caches (called on database load if CHERNOBOG_RESET=1)
@@ -53,6 +54,7 @@ void chernobog_clear_all_tracking() {
     s_processed_functions.clear();
     s_optblock_processed.clear();
     deflatten_handler_t::s_deferred_analysis.clear();
+    identity_call_handler_t::s_deferred_analysis.clear();
     msg("[chernobog] Cleared all deobfuscation caches\n");
 }
 
@@ -112,20 +114,33 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
     ctx.mba = mba;
     ctx.func_ea = func_ea;
 
-    // Check if we have pending analysis from maturity 0
+    int total_changes = 0;
+
+    // Check for pending identity call analysis from maturity 0
+    if (identity_call_handler_t::has_pending_analysis(func_ea)) {
+        msg("[optblock] Applying deferred identity call transformations for %a\n", func_ea);
+        int changes = identity_call_handler_t::apply_deferred(mba, &ctx);
+        if (changes > 0) {
+            msg("[optblock] Identity call handler applied %d changes\n", changes);
+            total_changes += changes;
+        }
+    }
+
+    // Check if we have pending deflattening analysis from maturity 0
     // The maturity 0 analysis uses block ADDRESSES which are stable across maturities
     if (deflatten_handler_t::has_pending_analysis(func_ea)) {
         msg("[optblock] Applying deferred analysis from maturity 0 for %a\n", func_ea);
         int changes = deflatten_handler_t::apply_deferred(mba, &ctx);
         if (changes > 0) {
             msg("[optblock] Deflattening applied %d changes from deferred analysis\n", changes);
+            total_changes += changes;
         } else {
             msg("[optblock] Deferred analysis made no changes, trying fresh analysis\n");
             // Fall through to fresh analysis
         }
         // apply_deferred clears the deferred analysis, so we won't try again
         if (changes > 0)
-            return changes;
+            return total_changes;
     }
 
     // No deferred analysis or it didn't help - try fresh analysis at maturity 3
