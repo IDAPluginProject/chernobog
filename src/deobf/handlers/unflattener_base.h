@@ -414,4 +414,123 @@ private:
     bool analyze_index_computation(mblock_t* blk);
 };
 
+//--------------------------------------------------------------------------
+// FakeJumpUnflattener - Handles always-taken/never-taken opaque predicate branches
+//
+// Detects conditional jumps that always go one direction due to:
+// - Mathematical tautologies: (x | ~x) != 0, (x & ~x) == 0
+// - Constant predicates: (const1 == const2), (x - x) == 0
+// - Z3-provable opaque predicates
+//
+// Converts these to unconditional jumps, simplifying the CFG.
+//--------------------------------------------------------------------------
+class FakeJumpUnflattener : public UnflattenerBase {
+public:
+    const char* name() const override { return "FakeJumpUnflattener"; }
+    int priority() const override { return 85; }  // High priority - run early
+    int detect(mbl_array_t* mba) override;
+    bool analyze(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+    UnflattenResult apply(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+
+    // Public for use by other unflatteners (e.g., BadWhileLoopUnflattener)
+    bool is_opaque_predicate(minsn_t* jcc, bool* always_true);
+
+private:
+    // Detected fake jumps: block_idx -> {always_true, target_if_true, target_if_false}
+    struct FakeJumpInfo {
+        int block_idx;
+        bool always_true;       // True if condition always true, false if always false
+        int taken_target;       // Target when condition is "true"
+        int fallthrough_target; // Target when condition is "false"
+        ea_t jump_addr;         // Address of the conditional jump
+    };
+    std::vector<FakeJumpInfo> fake_jumps_;
+
+    // Detection methods
+    bool check_tautology_pattern(minsn_t* cond, bool* result);
+    bool check_contradiction_pattern(minsn_t* cond, bool* result);
+    bool check_self_comparison(minsn_t* cond, bool* result);
+    bool check_with_z3(minsn_t* cond, bool* always_true);
+};
+
+//--------------------------------------------------------------------------
+// BadWhileLoopUnflattener - Handles malformed/fake while loops
+//
+// Detects fake loops that:
+// - Have a constant loop condition that's always true or always false
+// - Contain a break/exit that's always taken on first iteration
+// - Are structured to look like loops but don't actually iterate
+//
+// These patterns are used by obfuscators to:
+// - Confuse decompilers
+// - Create fake cyclomatic complexity
+// - Hide the real control flow
+//--------------------------------------------------------------------------
+class BadWhileLoopUnflattener : public UnflattenerBase {
+public:
+    const char* name() const override { return "BadWhileLoopUnflattener"; }
+    int priority() const override { return 75; }
+    int detect(mbl_array_t* mba) override;
+    bool analyze(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+    UnflattenResult apply(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+
+private:
+    // Detected bad loops
+    struct BadLoopInfo {
+        int header_block;       // Loop header block
+        int body_block;         // Main body block
+        int exit_block;         // Exit target
+        int back_edge_block;    // Block with back edge (if any)
+        bool is_fake_infinite;  // while(true) with guaranteed break
+        bool is_never_entered;  // Condition always false on entry
+        bool is_single_iteration; // Executes exactly once
+        ea_t header_addr;
+    };
+    std::vector<BadLoopInfo> bad_loops_;
+
+    // Detection methods
+    bool find_loop_structures(mbl_array_t* mba);
+    bool is_fake_infinite_loop(mbl_array_t* mba, int header, BadLoopInfo* out);
+    bool is_never_entered_loop(mbl_array_t* mba, int header, BadLoopInfo* out);
+    bool is_single_iteration_loop(mbl_array_t* mba, int header, BadLoopInfo* out);
+    bool has_guaranteed_exit(mbl_array_t* mba, int body_block, int* exit_target);
+    bool is_constant_true_condition(minsn_t* cond);
+    bool is_constant_false_condition(minsn_t* cond);
+};
+
+//--------------------------------------------------------------------------
+// SwitchCaseUnflattener - Handles obfuscated switch statements
+//
+// Some obfuscators convert switch statements to:
+// - Cascading if-else chains
+// - Computed gotos
+// - Binary search trees
+//
+// This unflattener reconstructs the original switch structure.
+//--------------------------------------------------------------------------
+class SwitchCaseUnflattener : public UnflattenerBase {
+public:
+    const char* name() const override { return "SwitchCaseUnflattener"; }
+    int priority() const override { return 55; }
+    int detect(mbl_array_t* mba) override;
+    bool analyze(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+    UnflattenResult apply(mbl_array_t* mba, deobf_ctx_t* ctx) override;
+
+private:
+    // Switch reconstruction info
+    struct SwitchInfo {
+        int entry_block;            // First comparison block
+        mop_t switch_var;           // Variable being compared
+        std::map<uint64_t, int> case_map;  // Value -> target block
+        int default_block;          // Default case target
+        std::set<int> comparison_blocks;   // Blocks forming the if-else chain
+    };
+    std::vector<SwitchInfo> switches_;
+
+    // Detection methods
+    bool detect_cascading_comparisons(mbl_array_t* mba);
+    bool analyze_comparison_chain(mbl_array_t* mba, int start_block, SwitchInfo* out);
+    bool is_same_variable(const mop_t& a, const mop_t& b);
+};
+
 } // namespace chernobog

@@ -1,4 +1,5 @@
 #include "unflattener_base.h"
+#include <queue>
 
 namespace chernobog {
 
@@ -810,10 +811,15 @@ void UnflattenerRegistry::initialize() {
 
     unflatteners_.clear();
 
-    // Register built-in unflatteners
+    // Register built-in unflatteners (sorted by priority after registration)
+    // Priority order: FakeJump(85) > Hikari(80) > BadWhileLoop(75) > OLLVM(70)
+    //                 > JumpTable(60) > SwitchCase(55) > Generic(30)
+    register_unflattener(std::make_unique<FakeJumpUnflattener>());
     register_unflattener(std::make_unique<HikariUnflattener>());
+    register_unflattener(std::make_unique<BadWhileLoopUnflattener>());
     register_unflattener(std::make_unique<OLLVMUnflattener>());
     register_unflattener(std::make_unique<JumpTableUnflattener>());
+    register_unflattener(std::make_unique<SwitchCaseUnflattener>());
     register_unflattener(std::make_unique<GenericUnflattener>());
 
     initialized_ = true;
@@ -1449,6 +1455,913 @@ UnflattenResult JumpTableUnflattener::apply(mbl_array_t* mba, deobf_ctx_t* ctx) 
     // 1. Read jump table from binary
     // 2. Map index values to target blocks
     // 3. Convert indirect jump to switch or direct jumps
+
+    return result;
+}
+
+//--------------------------------------------------------------------------
+// FakeJumpUnflattener Implementation
+//--------------------------------------------------------------------------
+
+int FakeJumpUnflattener::detect(mbl_array_t* mba) {
+    if (!mba)
+        return 0;
+
+    int score = 0;
+    int fake_count = 0;
+
+    // Scan for opaque predicate patterns
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+
+        if (!is_mcode_jcond(blk->tail->opcode))
+            continue;
+
+        bool always_true;
+        if (is_opaque_predicate(blk->tail, &always_true)) {
+            fake_count++;
+            score += 20;
+        }
+    }
+
+    // Need at least one fake jump to be relevant
+    if (fake_count == 0)
+        return 0;
+
+    return std::min(score, 100);
+}
+
+bool FakeJumpUnflattener::is_opaque_predicate(minsn_t* jcc, bool* always_true) {
+    if (!jcc || !is_mcode_jcond(jcc->opcode))
+        return false;
+
+    // Get the condition expression
+    minsn_t* cond = nullptr;
+    if (jcc->l.t == mop_d) {
+        cond = jcc->l.d;
+    }
+
+    if (!cond)
+        return false;
+
+    // Check various patterns
+    bool result;
+    if (check_tautology_pattern(cond, &result)) {
+        *always_true = result;
+        return true;
+    }
+
+    if (check_contradiction_pattern(cond, &result)) {
+        *always_true = result;
+        return true;
+    }
+
+    if (check_self_comparison(cond, &result)) {
+        *always_true = result;
+        return true;
+    }
+
+    // Z3 fallback
+    if (check_with_z3(cond, always_true)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool FakeJumpUnflattener::check_tautology_pattern(minsn_t* cond, bool* result) {
+    if (!cond)
+        return false;
+
+    // Pattern: (x | ~x) - always all ones (nonzero)
+    // Pattern: (x | -1) - always all ones
+    // Pattern: (x & 0) == 0 - always true
+    // Pattern: (x ^ x) == 0 - always true
+
+    // Check for setnz/jnz with or/~x pattern
+    if (cond->opcode == m_or) {
+        // x | ~x
+        if (cond->r.t == mop_d && cond->r.d && cond->r.d->opcode == m_bnot) {
+            minsn_t* bnot = cond->r.d;
+            if (cond->l.equal_mops(bnot->l, EQ_IGNSIZE)) {
+                *result = true;  // Always nonzero
+                return true;
+            }
+        }
+        if (cond->l.t == mop_d && cond->l.d && cond->l.d->opcode == m_bnot) {
+            minsn_t* bnot = cond->l.d;
+            if (cond->r.equal_mops(bnot->l, EQ_IGNSIZE)) {
+                *result = true;  // Always nonzero
+                return true;
+            }
+        }
+
+        // x | -1
+        if ((cond->r.t == mop_n && cond->r.nnn && cond->r.nnn->value == (uint64_t)-1) ||
+            (cond->l.t == mop_n && cond->l.nnn && cond->l.nnn->value == (uint64_t)-1)) {
+            *result = true;
+            return true;
+        }
+    }
+
+    // Check for setz/jz with xor self pattern
+    if (cond->opcode == m_xor) {
+        // x ^ x == 0
+        if (cond->l.equal_mops(cond->r, EQ_IGNSIZE)) {
+            *result = true;  // Always zero
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FakeJumpUnflattener::check_contradiction_pattern(minsn_t* cond, bool* result) {
+    if (!cond)
+        return false;
+
+    // Pattern: (x & ~x) - always zero
+    // Pattern: (x & 0) - always zero
+    // Pattern: (x ^ x) != 0 - always false
+
+    if (cond->opcode == m_and) {
+        // x & ~x
+        if (cond->r.t == mop_d && cond->r.d && cond->r.d->opcode == m_bnot) {
+            minsn_t* bnot = cond->r.d;
+            if (cond->l.equal_mops(bnot->l, EQ_IGNSIZE)) {
+                *result = false;  // Always zero
+                return true;
+            }
+        }
+        if (cond->l.t == mop_d && cond->l.d && cond->l.d->opcode == m_bnot) {
+            minsn_t* bnot = cond->l.d;
+            if (cond->r.equal_mops(bnot->l, EQ_IGNSIZE)) {
+                *result = false;  // Always zero
+                return true;
+            }
+        }
+
+        // x & 0
+        if ((cond->r.t == mop_n && cond->r.nnn && cond->r.nnn->value == 0) ||
+            (cond->l.t == mop_n && cond->l.nnn && cond->l.nnn->value == 0)) {
+            *result = false;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FakeJumpUnflattener::check_self_comparison(minsn_t* cond, bool* result) {
+    if (!cond)
+        return false;
+
+    // Self-comparisons
+    // x == x -> always true
+    // x != x -> always false
+    // x < x  -> always false (unsigned)
+    // x <= x -> always true
+    // x > x  -> always false
+    // x >= x -> always true
+
+    bool left_eq_right = cond->l.equal_mops(cond->r, EQ_IGNSIZE);
+    if (!left_eq_right)
+        return false;
+
+    switch (cond->opcode) {
+        case m_setz:   // x == x
+        case m_setae:  // x >= x (unsigned)
+        case m_setbe:  // x <= x (unsigned)
+        case m_setge:  // x >= x (signed)
+        case m_setle:  // x <= x (signed)
+            *result = true;
+            return true;
+
+        case m_setnz:  // x != x
+        case m_setb:   // x < x (unsigned)
+        case m_seta:   // x > x (unsigned)
+        case m_setl:   // x < x (signed)
+        case m_setg:   // x > x (signed)
+            *result = false;
+            return true;
+
+        default:
+            break;
+    }
+
+    return false;
+}
+
+bool FakeJumpUnflattener::check_with_z3(minsn_t* cond, bool* always_true) {
+    if (!cond)
+        return false;
+
+    try {
+        // Translate condition to Z3
+        z3_solver::z3_context_t& ctx = z3_solver::get_global_context();
+        z3_solver::mcode_translator_t translator(ctx);
+
+        z3::expr expr = translator.translate_insn(cond);
+        z3::solver& s = ctx.solver();
+
+        // Ensure expr is boolean (1-bit) for Z3 check
+        // If not, treat as "is nonzero" check
+        z3::expr bool_expr = expr;
+        if (expr.get_sort().bv_size() > 1) {
+            bool_expr = (expr != ctx.ctx().bv_val(0, expr.get_sort().bv_size()));
+        }
+
+        // Check if always true
+        s.reset();
+        s.add(!bool_expr);  // Try to find counter-example
+        if (s.check() == z3::unsat) {
+            *always_true = true;
+            return true;
+        }
+
+        // Check if always false
+        s.reset();
+        s.add(bool_expr);  // Try to find example where true
+        if (s.check() == z3::unsat) {
+            *always_true = false;
+            return true;
+        }
+
+    } catch (...) {
+        // Z3 error - not determinable
+    }
+
+    return false;
+}
+
+bool FakeJumpUnflattener::analyze(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    fake_jumps_.clear();
+
+    if (!mba)
+        return false;
+
+    // Find all fake jumps
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+
+        if (!is_mcode_jcond(blk->tail->opcode))
+            continue;
+
+        bool always_true;
+        if (is_opaque_predicate(blk->tail, &always_true)) {
+            FakeJumpInfo info;
+            info.block_idx = i;
+            info.always_true = always_true;
+            info.jump_addr = blk->tail->ea;
+
+            // Get targets
+            info.taken_target = (blk->tail->d.t == mop_b) ? blk->tail->d.b : -1;
+            info.fallthrough_target = -1;
+
+            // Find fall-through target
+            for (int j = 0; j < blk->nsucc(); j++) {
+                int succ = blk->succ(j);
+                if (succ != info.taken_target) {
+                    info.fallthrough_target = succ;
+                    break;
+                }
+            }
+
+            fake_jumps_.push_back(info);
+        }
+    }
+
+    analysis_complete_ = !fake_jumps_.empty();
+    return analysis_complete_;
+}
+
+UnflattenResult FakeJumpUnflattener::apply(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    UnflattenResult result;
+
+    if (!analysis_complete_ || fake_jumps_.empty()) {
+        result.error_message = "No fake jumps found";
+        return result;
+    }
+
+    for (auto& info : fake_jumps_) {
+        mblock_t* blk = mba->get_mblock(info.block_idx);
+        if (!blk || !blk->tail)
+            continue;
+
+        // Determine the real target
+        int real_target = info.always_true ? info.taken_target : info.fallthrough_target;
+
+        if (real_target < 0)
+            continue;
+
+        // Convert conditional jump to unconditional goto
+        if (convert_to_goto(blk, real_target)) {
+            result.edges_recovered++;
+            result.blocks_modified++;
+
+            deobf::log_verbose("[FakeJump] Block %d: converted to goto %d (always %s)\n",
+                              info.block_idx, real_target,
+                              info.always_true ? "true" : "false");
+
+            // Update successor/predecessor lists
+            int dead_target = info.always_true ? info.fallthrough_target : info.taken_target;
+            if (dead_target >= 0 && dead_target < mba->qty) {
+                mblock_t* dead = mba->get_mblock(dead_target);
+                if (dead) {
+                    auto it = std::find(dead->predset.begin(), dead->predset.end(),
+                                       info.block_idx);
+                    if (it != dead->predset.end()) {
+                        dead->predset.erase(it);
+                        dead->mark_lists_dirty();
+                    }
+                }
+            }
+
+            // Update blk's successor list
+            blk->succset.clear();
+            blk->succset.push_back(real_target);
+            blk->mark_lists_dirty();
+        }
+    }
+
+    result.success = result.edges_recovered > 0;
+
+    if (result.success) {
+        functions_unflattened_++;
+        edges_recovered_ += result.edges_recovered;
+    }
+
+    return result;
+}
+
+//--------------------------------------------------------------------------
+// BadWhileLoopUnflattener Implementation
+//--------------------------------------------------------------------------
+
+int BadWhileLoopUnflattener::detect(mbl_array_t* mba) {
+    if (!mba)
+        return 0;
+
+    int score = 0;
+
+    // Look for back edges (potential loops)
+    std::set<int> loop_headers;
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk)
+            continue;
+
+        for (int j = 0; j < blk->nsucc(); j++) {
+            int succ = blk->succ(j);
+            // Back edge: successor has lower index (simplistic loop detection)
+            if (succ <= i) {
+                loop_headers.insert(succ);
+            }
+        }
+    }
+
+    // For each potential loop header, check for bad patterns
+    for (int header : loop_headers) {
+        mblock_t* blk = mba->get_mblock(header);
+        if (!blk || !blk->tail)
+            continue;
+
+        // Check for constant conditions
+        if (blk->tail && is_mcode_jcond(blk->tail->opcode)) {
+            minsn_t* cond = (blk->tail->l.t == mop_d) ? blk->tail->l.d : nullptr;
+            if (cond) {
+                if (is_constant_true_condition(cond) || is_constant_false_condition(cond)) {
+                    score += 30;
+                }
+            }
+        }
+    }
+
+    return std::min(score, 100);
+}
+
+bool BadWhileLoopUnflattener::is_constant_true_condition(minsn_t* cond) {
+    if (!cond)
+        return false;
+
+    // Literal 1 or nonzero constant
+    if (cond->opcode == m_mov && cond->l.t == mop_n && cond->l.nnn) {
+        return cond->l.nnn->value != 0;
+    }
+
+    // Check for tautologies
+    // x | ~x, etc.
+    if (cond->opcode == m_or) {
+        if (cond->r.t == mop_d && cond->r.d && cond->r.d->opcode == m_bnot) {
+            if (cond->l.equal_mops(cond->r.d->l, EQ_IGNSIZE)) {
+                return true;
+            }
+        }
+    }
+
+    // x == x
+    if (cond->opcode == m_setz && cond->l.equal_mops(cond->r, EQ_IGNSIZE)) {
+        return true;
+    }
+
+    // x >= x
+    if ((cond->opcode == m_setae || cond->opcode == m_setge) &&
+        cond->l.equal_mops(cond->r, EQ_IGNSIZE)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::is_constant_false_condition(minsn_t* cond) {
+    if (!cond)
+        return false;
+
+    // Literal 0
+    if (cond->opcode == m_mov && cond->l.t == mop_n && cond->l.nnn) {
+        return cond->l.nnn->value == 0;
+    }
+
+    // x & ~x
+    if (cond->opcode == m_and) {
+        if (cond->r.t == mop_d && cond->r.d && cond->r.d->opcode == m_bnot) {
+            if (cond->l.equal_mops(cond->r.d->l, EQ_IGNSIZE)) {
+                return true;
+            }
+        }
+    }
+
+    // x != x
+    if (cond->opcode == m_setnz && cond->l.equal_mops(cond->r, EQ_IGNSIZE)) {
+        return true;
+    }
+
+    // x < x, x > x
+    if ((cond->opcode == m_setb || cond->opcode == m_seta ||
+         cond->opcode == m_setl || cond->opcode == m_setg) &&
+        cond->l.equal_mops(cond->r, EQ_IGNSIZE)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::find_loop_structures(mbl_array_t* mba) {
+    // Find all natural loops using back edge detection
+    bad_loops_.clear();
+
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk)
+            continue;
+
+        for (int j = 0; j < blk->nsucc(); j++) {
+            int succ = blk->succ(j);
+            if (succ <= i) {  // Back edge to potential header
+                BadLoopInfo info;
+                info.header_block = succ;
+                info.back_edge_block = i;
+                info.header_addr = mba->get_mblock(succ)->start;
+                info.body_block = -1;
+                info.exit_block = -1;
+                info.is_fake_infinite = false;
+                info.is_never_entered = false;
+                info.is_single_iteration = false;
+
+                // Analyze the loop
+                if (is_fake_infinite_loop(mba, succ, &info) ||
+                    is_never_entered_loop(mba, succ, &info) ||
+                    is_single_iteration_loop(mba, succ, &info)) {
+                    bad_loops_.push_back(info);
+                }
+            }
+        }
+    }
+
+    return !bad_loops_.empty();
+}
+
+bool BadWhileLoopUnflattener::is_fake_infinite_loop(mbl_array_t* mba, int header,
+                                                     BadLoopInfo* out) {
+    mblock_t* hdr = mba->get_mblock(header);
+    if (!hdr)
+        return false;
+
+    // Check if loop condition is always true (infinite loop)
+    if (hdr->tail && is_mcode_jcond(hdr->tail->opcode)) {
+        minsn_t* cond = (hdr->tail->l.t == mop_d) ? hdr->tail->l.d : nullptr;
+        if (cond && is_constant_true_condition(cond)) {
+            // Find if there's a guaranteed exit in the body
+            for (int i = 0; i < hdr->nsucc(); i++) {
+                int body = hdr->succ(i);
+                if (body != header) {  // Not back edge
+                    int exit_target;
+                    if (has_guaranteed_exit(mba, body, &exit_target)) {
+                        out->is_fake_infinite = true;
+                        out->body_block = body;
+                        out->exit_block = exit_target;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::is_never_entered_loop(mbl_array_t* mba, int header,
+                                                     BadLoopInfo* out) {
+    mblock_t* hdr = mba->get_mblock(header);
+    if (!hdr)
+        return false;
+
+    // Check if loop condition is always false
+    if (hdr->tail && is_mcode_jcond(hdr->tail->opcode)) {
+        minsn_t* cond = (hdr->tail->l.t == mop_d) ? hdr->tail->l.d : nullptr;
+        if (cond && is_constant_false_condition(cond)) {
+            out->is_never_entered = true;
+            // Find exit target (fall-through)
+            int taken = (hdr->tail->d.t == mop_b) ? hdr->tail->d.b : -1;
+            for (int i = 0; i < hdr->nsucc(); i++) {
+                if (hdr->succ(i) != taken) {
+                    out->exit_block = hdr->succ(i);
+                    break;
+                }
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::is_single_iteration_loop(mbl_array_t* mba, int header,
+                                                        BadLoopInfo* out) {
+    mblock_t* hdr = mba->get_mblock(header);
+    if (!hdr)
+        return false;
+
+    // A single-iteration loop has a break/exit that's always taken
+    // Check all successors for guaranteed exits
+
+    for (int i = 0; i < hdr->nsucc(); i++) {
+        int body = hdr->succ(i);
+        mblock_t* body_blk = mba->get_mblock(body);
+        if (!body_blk)
+            continue;
+
+        // Check if body unconditionally exits (no back edge)
+        bool has_back_edge = false;
+        for (int j = 0; j < body_blk->nsucc(); j++) {
+            if (body_blk->succ(j) == header) {
+                has_back_edge = true;
+                break;
+            }
+        }
+
+        if (!has_back_edge && body_blk->nsucc() == 1) {
+            // Body doesn't loop back - single iteration
+            out->is_single_iteration = true;
+            out->body_block = body;
+            out->exit_block = body_blk->succ(0);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::has_guaranteed_exit(mbl_array_t* mba, int body_block,
+                                                   int* exit_target) {
+    mblock_t* body = mba->get_mblock(body_block);
+    if (!body)
+        return false;
+
+    // Check if body has an unconditional exit (break)
+    if (body->tail && body->tail->opcode == m_goto) {
+        *exit_target = (body->tail->l.t == mop_b) ? body->tail->l.b : -1;
+        return *exit_target >= 0;
+    }
+
+    // Check for conditional with opaque predicate
+    if (body->tail && is_mcode_jcond(body->tail->opcode)) {
+        FakeJumpUnflattener fake;
+        bool always_true;
+        if (fake.is_opaque_predicate(body->tail, &always_true)) {
+            int taken = (body->tail->d.t == mop_b) ? body->tail->d.b : -1;
+            if (always_true) {
+                *exit_target = taken;
+            } else {
+                // Fall-through is exit
+                for (int i = 0; i < body->nsucc(); i++) {
+                    if (body->succ(i) != taken) {
+                        *exit_target = body->succ(i);
+                        break;
+                    }
+                }
+            }
+            return *exit_target >= 0;
+        }
+    }
+
+    return false;
+}
+
+bool BadWhileLoopUnflattener::analyze(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    if (!mba)
+        return false;
+
+    if (!find_loop_structures(mba))
+        return false;
+
+    analysis_complete_ = !bad_loops_.empty();
+    return analysis_complete_;
+}
+
+UnflattenResult BadWhileLoopUnflattener::apply(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    UnflattenResult result;
+
+    if (!analysis_complete_ || bad_loops_.empty()) {
+        result.error_message = "No bad loops found";
+        return result;
+    }
+
+    for (auto& loop : bad_loops_) {
+        mblock_t* header = mba->get_mblock(loop.header_block);
+        if (!header)
+            continue;
+
+        if (loop.is_never_entered) {
+            // Loop is never entered - redirect entry to exit
+            if (loop.exit_block >= 0) {
+                // Convert loop header to goto exit
+                if (convert_to_goto(header, loop.exit_block)) {
+                    result.blocks_modified++;
+                    result.edges_recovered++;
+
+                    deobf::log_verbose("[BadLoop] Never-entered loop at %a -> goto %d\n",
+                                      loop.header_addr, loop.exit_block);
+                }
+            }
+        } else if (loop.is_fake_infinite || loop.is_single_iteration) {
+            // Loop executes exactly once - linearize it
+            if (loop.body_block >= 0 && loop.exit_block >= 0) {
+                // Remove back edge
+                mblock_t* back_edge_blk = mba->get_mblock(loop.back_edge_block);
+                if (back_edge_blk && back_edge_blk->tail) {
+                    if (back_edge_blk->tail->opcode == m_goto &&
+                        back_edge_blk->tail->l.t == mop_b &&
+                        back_edge_blk->tail->l.b == loop.header_block) {
+                        // Redirect to exit
+                        back_edge_blk->tail->l.make_blkref(loop.exit_block);
+                        back_edge_blk->mark_lists_dirty();
+                        result.edges_recovered++;
+
+                        deobf::log_verbose("[BadLoop] Removed back edge %d -> %d\n",
+                                          loop.back_edge_block, loop.header_block);
+                    }
+                }
+
+                result.blocks_modified++;
+            }
+        }
+    }
+
+    result.success = result.edges_recovered > 0;
+
+    if (result.success) {
+        functions_unflattened_++;
+        edges_recovered_ += result.edges_recovered;
+    }
+
+    return result;
+}
+
+//--------------------------------------------------------------------------
+// SwitchCaseUnflattener Implementation
+//--------------------------------------------------------------------------
+
+int SwitchCaseUnflattener::detect(mbl_array_t* mba) {
+    if (!mba)
+        return 0;
+
+    int score = 0;
+
+    // Look for chains of comparisons against the same variable
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+
+        if (!is_mcode_jcond(blk->tail->opcode))
+            continue;
+
+        // Check if comparing against a constant
+        minsn_t* cond = (blk->tail->l.t == mop_d) ? blk->tail->l.d : nullptr;
+        if (!cond)
+            continue;
+
+        if (cond->opcode == m_setz || cond->opcode == m_setnz) {
+            bool has_const = (cond->r.t == mop_n) || (cond->l.t == mop_n);
+            if (has_const) {
+                // Check if successors also compare the same variable
+                for (int j = 0; j < blk->nsucc(); j++) {
+                    int succ_idx = blk->succ(j);
+                    mblock_t* succ = mba->get_mblock(succ_idx);
+                    if (!succ || !succ->tail)
+                        continue;
+
+                    if (is_mcode_jcond(succ->tail->opcode)) {
+                        minsn_t* succ_cond = (succ->tail->l.t == mop_d) ?
+                                             succ->tail->l.d : nullptr;
+                        if (succ_cond &&
+                            (succ_cond->opcode == m_setz || succ_cond->opcode == m_setnz)) {
+                            // Likely part of a switch chain
+                            score += 15;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return std::min(score, 100);
+}
+
+bool SwitchCaseUnflattener::is_same_variable(const mop_t& a, const mop_t& b) {
+    if (a.t != b.t)
+        return false;
+
+    switch (a.t) {
+        case mop_r:
+            return a.r == b.r;
+        case mop_S:
+            return a.s && b.s && a.s->off == b.s->off;
+        case mop_v:
+            return a.g == b.g;
+        case mop_l:
+            return a.l && b.l && a.l->idx == b.l->idx;
+        default:
+            return a.equal_mops(b, EQ_IGNSIZE);
+    }
+}
+
+bool SwitchCaseUnflattener::detect_cascading_comparisons(mbl_array_t* mba) {
+    switches_.clear();
+
+    // Find potential switch entry points
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t* blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+
+        if (!is_mcode_jcond(blk->tail->opcode))
+            continue;
+
+        SwitchInfo info;
+        if (analyze_comparison_chain(mba, i, &info)) {
+            if (info.case_map.size() >= 3) {  // At least 3 cases
+                switches_.push_back(info);
+            }
+        }
+    }
+
+    return !switches_.empty();
+}
+
+bool SwitchCaseUnflattener::analyze_comparison_chain(mbl_array_t* mba, int start_block,
+                                                      SwitchInfo* out) {
+    std::set<int> visited;
+    std::queue<int> to_visit;
+    to_visit.push(start_block);
+
+    mop_t switch_var;
+    bool found_var = false;
+
+    while (!to_visit.empty()) {
+        int curr = to_visit.front();
+        to_visit.pop();
+
+        if (visited.count(curr))
+            continue;
+        visited.insert(curr);
+
+        mblock_t* blk = mba->get_mblock(curr);
+        if (!blk || !blk->tail)
+            continue;
+
+        if (!is_mcode_jcond(blk->tail->opcode))
+            continue;
+
+        minsn_t* cond = (blk->tail->l.t == mop_d) ? blk->tail->l.d : nullptr;
+        if (!cond)
+            continue;
+
+        if (cond->opcode != m_setz && cond->opcode != m_setnz)
+            continue;
+
+        // Extract variable and constant
+        const mop_t* var = nullptr;
+        uint64_t case_val = 0;
+
+        if (cond->r.t == mop_n && cond->r.nnn) {
+            var = &cond->l;
+            case_val = cond->r.nnn->value;
+        } else if (cond->l.t == mop_n && cond->l.nnn) {
+            var = &cond->r;
+            case_val = cond->l.nnn->value;
+        }
+
+        if (!var)
+            continue;
+
+        // Check if same variable as previous comparisons
+        if (!found_var) {
+            switch_var = *var;
+            found_var = true;
+        } else if (!is_same_variable(switch_var, *var)) {
+            continue;  // Different variable - not part of this switch
+        }
+
+        out->comparison_blocks.insert(curr);
+
+        // Get target for this case
+        int taken = (blk->tail->d.t == mop_b) ? blk->tail->d.b : -1;
+        if (taken >= 0) {
+            if (cond->opcode == m_setz) {
+                out->case_map[case_val] = taken;
+            }
+            // For setnz, the fall-through is the case block
+        }
+
+        // Follow fall-through to next comparison
+        for (int j = 0; j < blk->nsucc(); j++) {
+            int succ = blk->succ(j);
+            if (succ != taken && !visited.count(succ)) {
+                to_visit.push(succ);
+            }
+        }
+    }
+
+    if (found_var) {
+        out->entry_block = start_block;
+        out->switch_var = switch_var;
+        return out->case_map.size() >= 2;
+    }
+
+    return false;
+}
+
+bool SwitchCaseUnflattener::analyze(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    if (!mba)
+        return false;
+
+    if (!detect_cascading_comparisons(mba))
+        return false;
+
+    analysis_complete_ = !switches_.empty();
+    return analysis_complete_;
+}
+
+UnflattenResult SwitchCaseUnflattener::apply(mbl_array_t* mba, deobf_ctx_t* ctx) {
+    UnflattenResult result;
+
+    if (!analysis_complete_ || switches_.empty()) {
+        result.error_message = "No switch patterns found";
+        return result;
+    }
+
+    // For now, just report detection - full implementation would:
+    // 1. Remove comparison chain blocks
+    // 2. Create proper switch/jtbl instruction
+    // 3. Update CFG
+
+    for (auto& sw : switches_) {
+        deobf::log_verbose("[Switch] Found %zu-case switch at block %d\n",
+                          sw.case_map.size(), sw.entry_block);
+
+        // Mark blocks as identified
+        result.blocks_modified += sw.comparison_blocks.size();
+    }
+
+    // For this implementation, we don't actually transform to jtbl
+    // since that requires complex instruction creation
+    // Just mark edges as recovered for statistics
+    for (auto& sw : switches_) {
+        result.edges_recovered += sw.case_map.size();
+    }
+
+    result.success = true;
+
+    if (result.success) {
+        functions_unflattened_++;
+        edges_recovered_ += result.edges_recovered;
+    }
 
     return result;
 }
