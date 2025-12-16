@@ -357,6 +357,162 @@ static int count_state_constants(mbl_array_t *mba, std::set<uint64_t> *out_const
 }
 
 //--------------------------------------------------------------------------
+// Jump table-based flattening detection (index-based, not magic constants)
+// This pattern uses small integers (0, 1, 2...) as indices into a jump table
+//--------------------------------------------------------------------------
+struct jmptbl_info_t {
+    int block_idx;              // Block containing the ijmp
+    ea_t table_addr;            // Address of jump table
+    int num_cases;              // Number of cases detected
+    mop_t index_var;            // Variable holding the index
+};
+
+static bool detect_jump_table_pattern(mbl_array_t *mba, std::vector<jmptbl_info_t> *out_tables) {
+    if (!mba)
+        return false;
+
+    std::vector<jmptbl_info_t> tables;
+
+    // First, check IDA's switch info for all addresses in the function
+    // IDA often detects switches at the assembly level even if microcode doesn't have m_ijmp
+    func_t *pfn = get_func(mba->entry_ea);
+    if (pfn) {
+        ea_t ea = pfn->start_ea;
+        while (ea < pfn->end_ea) {
+            switch_info_t si;
+            if (get_switch_info(&si, ea) > 0 && si.get_jtable_size() >= 20) {
+                jmptbl_info_t info;
+                info.block_idx = -1;  // Will find block later
+                info.table_addr = si.jumps;
+                info.num_cases = (int)si.get_jtable_size();
+                deobf::log("[pattern] IDA switch at %a: %d cases, table at 0x%llx\n",
+                          ea, info.num_cases, (unsigned long long)info.table_addr);
+                tables.push_back(info);
+            }
+            ea = next_head(ea, pfn->end_ea);
+            if (ea == BADADDR) break;
+        }
+    }
+
+    // If we found IDA-detected switches, don't need microcode search
+    if (!tables.empty()) {
+        if (out_tables)
+            *out_tables = tables;
+        return true;
+    }
+
+    // Fallback: scan microcode for indirect jumps
+    deobf::log("[pattern] Scanning microcode for indirect jumps...\n");
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t *blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+
+        // Log block terminator opcodes for debugging
+        if (i < 5 || blk->tail->opcode == m_ijmp || blk->tail->opcode == m_goto) {
+            deobf::log_verbose("[pattern] Block %d tail: opcode=%d (m_ijmp=%d, m_goto=%d)\n",
+                      i, blk->tail->opcode, m_ijmp, m_goto);
+        }
+
+        // Look for indirect jumps (ijmp)
+        if (blk->tail->opcode != m_ijmp)
+            continue;
+
+        jmptbl_info_t info;
+        info.block_idx = i;
+        info.table_addr = BADADDR;
+        info.num_cases = 0;
+
+        // The target of ijmp comes from a computation
+        // Look backwards for the pattern: load from [table + index*8]
+        // In microcode this could be: ldx / add / mul sequence
+
+        // Try to extract jump table info from IDA's switch analysis
+        switch_info_t si;
+        if (get_switch_info(&si, blk->start) > 0 ||
+            get_switch_info(&si, blk->tail->ea) > 0) {
+            info.table_addr = si.jumps;
+            info.num_cases = (int)si.get_jtable_size();
+            deobf::log("[pattern] Found IDA-detected switch at block %d: %zu cases, table at 0x%llx\n",
+                      i, (size_t)info.num_cases, (unsigned long long)info.table_addr);
+            tables.push_back(info);
+            continue;
+        }
+
+        // Fallback: manually scan for jump table pattern
+        // Look for memory loads that could be jump table accesses
+        for (minsn_t *ins = blk->tail->prev; ins; ins = ins->prev) {
+            // ldx instruction loads from memory
+            if (ins->opcode == m_ldx) {
+                // Check if loading from a global variable (jump table base)
+                if (ins->r.t == mop_v) {
+                    info.table_addr = ins->r.g;
+                    // Try to determine number of cases by analyzing table contents
+                    ea_t ptr = info.table_addr;
+                    info.num_cases = 0;
+                    for (int j = 0; j < 512; j++) {  // Reasonable limit
+                        ea_t target = 0;
+                        if (get_bytes(&target, sizeof(ea_t), ptr) != sizeof(ea_t))
+                            break;
+                        if (target == 0 || target == BADADDR)
+                            break;
+                        // Validate it looks like a code address
+                        if (is_code(get_flags(target)) || is_func(get_flags(target))) {
+                            info.num_cases++;
+                            ptr += sizeof(ea_t);
+                        } else {
+                            break;
+                        }
+                    }
+                    if (info.num_cases > 10) {
+                        deobf::log("[pattern] Found manual switch at block %d: %d cases, table at 0x%llx\n",
+                                  i, info.num_cases, (unsigned long long)info.table_addr);
+                        tables.push_back(info);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if (out_tables)
+        *out_tables = tables;
+
+    return !tables.empty();
+}
+
+//--------------------------------------------------------------------------
+// Count small state indices used as local variables
+// Hikari table-based flattening initializes multiple state variables like:
+//   var_14 = 0, var_24 = 1, var_44 = 3, var_54 = 4, etc.
+//--------------------------------------------------------------------------
+static int count_state_index_assignments(mbl_array_t *mba, int max_index = 300) {
+    std::set<uint64_t> indices;
+
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t *blk = mba->get_mblock(i);
+        if (!blk)
+            continue;
+
+        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+            // Look for mov of small constants to stack variables
+            if (ins->opcode == m_mov && ins->l.t == mop_n) {
+                uint64_t val = ins->l.nnn->value;
+                // Check if it's a small index (0-300 for most flattened functions)
+                if (val <= (uint64_t)max_index) {
+                    // Check if destination is a stack or local variable
+                    if (ins->d.t == mop_S || ins->d.t == mop_l) {
+                        indices.insert(val);
+                    }
+                }
+            }
+        }
+    }
+
+    return (int)indices.size();
+}
+
+//--------------------------------------------------------------------------
 bool detect_flatten_pattern(mbl_array_t *mba, flatten_info_t *out) {
     if (!mba || mba->qty < 4)
         return false;
@@ -377,6 +533,41 @@ bool detect_flatten_pattern(mbl_array_t *mba, flatten_info_t *out) {
             out->loop_end_block = -1;
         }
         return true;
+    }
+
+    // Check for jump table-based flattening (index-based, not magic constants)
+    // This is a different Hikari variant that uses small indices (0, 1, 2...)
+    // into jump tables instead of magic constants
+    deobf::log("[pattern] Checking for jump table-based flattening...\n");
+    std::vector<jmptbl_info_t> jump_tables;
+    if (detect_jump_table_pattern(mba, &jump_tables)) {
+        deobf::log("[pattern] Found %zu jump tables\n", jump_tables.size());
+        // Check if we have a large jump table (>20 cases is suspicious)
+        for (const auto& jt : jump_tables) {
+            deobf::log("[pattern] Jump table: block=%d, cases=%d\n", jt.block_idx, jt.num_cases);
+            if (jt.num_cases >= 20) {
+                // Also check for many small index assignments
+                int index_count = count_state_index_assignments(mba, jt.num_cases + 10);
+                deobf::log("[pattern] Jump table at block %d has %d cases, found %d index assignments\n",
+                          jt.block_idx, jt.num_cases, index_count);
+
+                // If we have many small indices AND a large jump table, likely flattened
+                if (index_count >= 5) {
+                    deobf::log("[pattern] Detected jump table-based flattening!\n");
+                    if (out) {
+                        out->dispatcher_block = jt.block_idx;
+                        out->loop_end_block = -1;
+                        // For index-based flattening, state values are 0, 1, 2...
+                        for (int i = 0; i < jt.num_cases; i++) {
+                            out->state_to_block[i] = -1;  // Targets resolved via jump table
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+    } else {
+        deobf::log("[pattern] No jump tables found\n");
     }
 
     // Strategy:

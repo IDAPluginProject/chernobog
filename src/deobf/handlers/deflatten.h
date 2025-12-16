@@ -139,6 +139,10 @@ private:
     // Z3-based analysis
     //----------------------------------------------------------------------
 
+    // Analyze jump table-based flattening (index-based, not magic constants)
+    static bool analyze_jump_table_flattening(mbl_array_t *mba,
+                                              std::vector<dispatcher_info_t> &dispatchers);
+
     // Analyze all dispatchers in the function using Z3
     static std::vector<dispatcher_info_t> analyze_dispatchers_z3(mbl_array_t *mba);
 

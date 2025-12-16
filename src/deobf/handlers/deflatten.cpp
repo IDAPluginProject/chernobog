@@ -56,6 +56,13 @@ bool deflatten_handler_t::is_state_constant(uint64_t val) {
 }
 
 //--------------------------------------------------------------------------
+// Check if a value is a valid jump-table index
+//--------------------------------------------------------------------------
+static bool is_jump_table_index(uint64_t val, int max_cases) {
+    return val < (uint64_t)max_cases;
+}
+
+//--------------------------------------------------------------------------
 // Utility: Find all state constants in a block
 //--------------------------------------------------------------------------
 std::set<uint64_t> deflatten_handler_t::find_state_constants(const mblock_t *blk) {
@@ -217,6 +224,532 @@ bool deflatten_handler_t::analyze_dispatcher_block(mbl_array_t *mba, int block_i
 }
 
 //--------------------------------------------------------------------------
+// Index variable info - represents a state variable in jump table flattening
+//--------------------------------------------------------------------------
+struct index_var_info_t {
+    mop_t var;              // The index variable (stack or local)
+    int dispatcher_block;   // Block where this var is used for dispatch
+    ea_t jump_table;        // Associated jump table address
+    int num_cases;          // Number of cases in jump table
+
+    index_var_info_t() : dispatcher_block(-1), jump_table(BADADDR), num_cases(0) {}
+};
+
+//--------------------------------------------------------------------------
+// Extract index variable from a multiplication expression
+// Handles patterns like: 8 * xds(var) or xds(var) * 8
+//--------------------------------------------------------------------------
+static bool extract_index_from_mul(const minsn_t *mul_ins, mop_t *out_var) {
+    if (!mul_ins || mul_ins->opcode != m_mul)
+        return false;
+
+    // Check if multiplying by 8 (pointer size for 64-bit)
+    const mop_t *index_op = nullptr;
+    if (mul_ins->r.t == mop_n && mul_ins->r.nnn->value == 8) {
+        index_op = &mul_ins->l;
+    } else if (mul_ins->l.t == mop_n && mul_ins->l.nnn->value == 8) {
+        index_op = &mul_ins->r;
+    }
+
+    if (!index_op)
+        return false;
+
+    // The index might be sign-extended (xds instruction)
+    if (index_op->t == mop_d && index_op->d && index_op->d->opcode == m_xds) {
+        *out_var = index_op->d->l;
+        return true;
+    }
+
+    // Or it might be a direct variable reference
+    if (index_op->t == mop_S || index_op->t == mop_l || index_op->t == mop_r) {
+        *out_var = *index_op;
+        return true;
+    }
+
+    return false;
+}
+
+//--------------------------------------------------------------------------
+// Find index variable used in a block ending with ijmp
+// Traces backwards from ijmp to find the variable used as index
+// Handles pattern: ldx ds, (BASE + 8 * xds(INDEX_VAR)), dst; ijmp cs, dst
+//--------------------------------------------------------------------------
+static bool find_index_variable(mblock_t *blk, index_var_info_t *out) {
+    if (!blk || !blk->tail || blk->tail->opcode != m_ijmp)
+        return false;
+
+    // The ijmp target comes from a register loaded via computed address
+    // Pattern: ldx ds, [table + index*8] -> reg; ijmp cs, reg
+
+    // Find the ldx that provides the jump target
+    for (minsn_t *ins = blk->tail->prev; ins; ins = ins->prev) {
+        if (ins->opcode != m_ldx)
+            continue;
+
+        // ldx has: l=segment, r=address, d=destination
+        // We need to analyze the address operand (r)
+        const mop_t &addr = ins->r;
+
+        // The address is a compound expression like (base + index*8)
+        if (addr.t == mop_d && addr.d) {
+            const minsn_t *addr_expr = addr.d;
+
+            // Look for add operation
+            if (addr_expr->opcode == m_add) {
+                // Check both operands for mul by 8
+                mop_t index_var;
+
+                // Check left operand for mul*8
+                if (addr_expr->l.t == mop_d && addr_expr->l.d) {
+                    if (extract_index_from_mul(addr_expr->l.d, &index_var)) {
+                        out->var = index_var;
+                        out->dispatcher_block = blk->serial;
+                        deobf::log_verbose("[deflatten] Found index var in ldx at block %d (type=%d)\n",
+                                  blk->serial, index_var.t);
+                        return true;
+                    }
+                }
+
+                // Check right operand for mul*8
+                if (addr_expr->r.t == mop_d && addr_expr->r.d) {
+                    if (extract_index_from_mul(addr_expr->r.d, &index_var)) {
+                        out->var = index_var;
+                        out->dispatcher_block = blk->serial;
+                        deobf::log_verbose("[deflatten] Found index var in ldx at block %d (type=%d)\n",
+                                  blk->serial, index_var.t);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+//--------------------------------------------------------------------------
+// Find all writes of small integer constants to a given variable in a block
+// Returns pairs of (written_value, writing_instruction)
+//--------------------------------------------------------------------------
+static std::vector<std::pair<uint64_t, minsn_t*>>
+find_index_writes(mblock_t *blk, const mop_t &index_var, int max_value = 300) {
+    std::vector<std::pair<uint64_t, minsn_t*>> writes;
+
+    if (!blk)
+        return writes;
+
+    for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        // Look for mov of small constant to the index variable
+        if (ins->opcode != m_mov)
+            continue;
+
+        // Check if source is a small constant
+        if (ins->l.t != mop_n)
+            continue;
+
+        uint64_t val = ins->l.nnn->value;
+        if (val > (uint64_t)max_value)
+            continue;
+
+        // Check if destination matches the index variable
+        // Need to compare the variable identity
+        bool match = false;
+        if (ins->d.t == index_var.t) {
+            if (index_var.t == mop_S) {
+                // Stack variable - compare offset
+                match = (ins->d.s->off == index_var.s->off);
+            } else if (index_var.t == mop_l) {
+                // Local variable - compare index
+                match = (ins->d.l->idx == index_var.l->idx);
+            } else if (index_var.t == mop_r) {
+                // Register - compare register
+                match = (ins->d.r == index_var.r);
+            }
+        }
+
+        if (match) {
+            writes.push_back({val, ins});
+        }
+    }
+
+    return writes;
+}
+
+//--------------------------------------------------------------------------
+// Find ALL writes of small integers to ANY stack/local variable in a block
+// This is for jump table flattening where multiple index variables exist
+// Returns pairs of (written_value, stack_offset_or_local_idx)
+//--------------------------------------------------------------------------
+static std::vector<std::pair<uint64_t, int64_t>>
+find_all_index_writes(mblock_t *blk, int max_value = 300) {
+    std::vector<std::pair<uint64_t, int64_t>> writes;
+
+    if (!blk)
+        return writes;
+
+    for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        uint64_t val = 0;
+        int64_t var_id = -1;
+
+        // Handle mov instruction: mov src, dst
+        if (ins->opcode == m_mov) {
+            // Check if source is a small constant
+            if (ins->l.t != mop_n)
+                continue;
+
+            val = ins->l.nnn->value;
+            if (val > (uint64_t)max_value)
+                continue;
+
+            // Focus on 4-byte destinations (typical index var size)
+            // but also accept 8-byte for sign-extended cases
+            if (ins->d.size != 4 && ins->d.size != 8)
+                continue;
+
+            // Check if destination is a stack or local variable
+            if (ins->d.t == mop_S) {
+                var_id = ins->d.s->off;
+            } else if (ins->d.t == mop_l) {
+                var_id = ins->d.l->idx;
+            }
+        }
+        // Handle stx instruction: stx val, seg, dst
+        // stx stores a value to memory: l=value, r=segment, d=address
+        else if (ins->opcode == m_stx) {
+            // Check if value is a small constant
+            if (ins->l.t != mop_n)
+                continue;
+
+            val = ins->l.nnn->value;
+            if (val > (uint64_t)max_value)
+                continue;
+
+            // Focus on 4-byte destinations (typical index var size)
+            if (ins->l.size != 4 && ins->l.size != 8)
+                continue;
+
+            // Check if destination is a stack variable
+            if (ins->d.t == mop_S) {
+                var_id = ins->d.s->off;
+            } else if (ins->d.t == mop_l) {
+                var_id = ins->d.l->idx;
+            }
+        }
+        else {
+            continue;
+        }
+
+        if (var_id >= 0) {
+            writes.push_back({val, var_id});
+        }
+    }
+
+    return writes;
+}
+
+//--------------------------------------------------------------------------
+// Analyze jump table-based flattening (index-based, not magic constants)
+// Returns true if this appears to be jump table flattening
+//--------------------------------------------------------------------------
+bool deflatten_handler_t::analyze_jump_table_flattening(mbl_array_t *mba,
+                                           std::vector<dispatcher_info_t> &dispatchers) {
+    if (!mba)
+        return false;
+
+    // Step 1: Find all blocks with indirect jumps and their index variables
+    std::vector<index_var_info_t> index_vars;
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t *blk = mba->get_mblock(i);
+        if (!blk || !blk->tail)
+            continue;
+        if (blk->tail->opcode == m_ijmp) {
+            index_var_info_t info;
+            if (find_index_variable(blk, &info)) {
+                index_vars.push_back(info);
+                int64_t var_off = -1;
+                if (info.var.t == mop_S && info.var.s)
+                    var_off = info.var.s->off;
+                else if (info.var.t == mop_l && info.var.l)
+                    var_off = info.var.l->idx;
+                deobf::log("[deflatten] Block %d: found index var (type=%d, off=%lld)\n",
+                          i, info.var.t, (long long)var_off);
+            }
+        }
+    }
+
+    if (index_vars.empty()) {
+        deobf::log("[deflatten] No index variables found in ijmp blocks\n");
+        // Fall through to IDA switch-based analysis
+    } else {
+        deobf::log("[deflatten] Found %zu index variables in ijmp blocks\n", index_vars.size());
+    }
+
+    // Step 2: Get IDA's switch detection for mapping state values to blocks
+    func_t *pfn = get_func(mba->entry_ea);
+    if (!pfn) {
+        deobf::log("[deflatten] Could not get function for switch analysis\n");
+        return false;
+    }
+
+    // Collect all switches in the function
+    std::map<ea_t, switch_info_t> switches;
+    ea_t ea = pfn->start_ea;
+    while (ea < pfn->end_ea) {
+        switch_info_t si;
+        if (get_switch_info(&si, ea) > 0 && si.get_jtable_size() >= 10) {
+            switches[ea] = si;
+        }
+        ea = next_head(ea, pfn->end_ea);
+        if (ea == BADADDR) break;
+    }
+
+    if (switches.empty()) {
+        deobf::log("[deflatten] No IDA-detected switches found\n");
+        return false;
+    }
+
+    deobf::log("[deflatten] Found %zu IDA-detected switches\n", switches.size());
+
+    // Step 3: Build dispatcher info for each large switch
+    // For jump table flattening, we need to:
+    // - Map state values (indices) to case blocks
+    // - Identify which index variable each dispatcher uses
+    // - Find state transitions by tracing index writes in case blocks
+
+    // Find the primary (largest) jump table - this is likely the main dispatcher
+    ea_t primary_switch_ea = BADADDR;
+    int max_cases = 0;
+    for (const auto& kv : switches) {
+        if ((int)kv.second.get_jtable_size() > max_cases) {
+            max_cases = kv.second.get_jtable_size();
+            primary_switch_ea = kv.first;
+        }
+    }
+
+    if (primary_switch_ea == BADADDR) {
+        deobf::log("[deflatten] No primary switch found\n");
+        return false;
+    }
+
+    const switch_info_t &primary_si = switches[primary_switch_ea];
+    deobf::log("[deflatten] Primary switch at %a: %d cases, table at %a\n",
+              primary_switch_ea, max_cases, primary_si.jumps);
+
+    // Build the main dispatcher
+    dispatcher_info_t disp;
+    disp.is_solved = true;
+
+    // Find the dispatcher block
+    for (int i = 0; i < mba->qty; i++) {
+        mblock_t *blk = mba->get_mblock(i);
+        if (blk && blk->start <= primary_switch_ea && primary_switch_ea < blk->end) {
+            disp.block_idx = i;
+            break;
+        }
+    }
+
+    // Build state_to_block mapping from jump table
+    ea_t table = primary_si.jumps;
+    int num_cases = (int)primary_si.get_jtable_size();
+
+    for (int idx = 0; idx < num_cases && idx < 300; idx++) {
+        ea_t target = 0;
+        if (get_bytes(&target, sizeof(ea_t), table + idx * sizeof(ea_t)) == sizeof(ea_t)) {
+            for (int bi = 0; bi < mba->qty; bi++) {
+                mblock_t *blk = mba->get_mblock(bi);
+                if (blk && blk->start <= target && target < blk->end) {
+                    disp.state_to_block[idx] = bi;
+                    disp.case_blocks.insert(bi);
+                    break;
+                }
+            }
+        }
+    }
+
+    deobf::log("[deflatten] Built state_to_block with %zu mappings\n", disp.state_to_block.size());
+
+    // Step 4: Build a map of index variable offsets -> their usage
+    // For jump table flattening, multiple index variables control different entry points
+    std::set<int64_t> known_index_offsets;
+    for (const auto &iv : index_vars) {
+        if (iv.var.t == mop_S) {
+            known_index_offsets.insert(iv.var.s->off);
+        } else if (iv.var.t == mop_l) {
+            known_index_offsets.insert(iv.var.l->idx);
+        }
+    }
+
+    deobf::log("[deflatten] Found %zu unique index variable offsets:\n", known_index_offsets.size());
+    for (int64_t off : known_index_offsets) {
+        deobf::log("[deflatten]   offset: %lld (0x%llx)\n", (long long)off, (unsigned long long)off);
+    }
+
+    // Step 5: For each case block, find ALL writes of small integers
+    // This captures state transitions regardless of which index variable is used
+    struct transition_t {
+        int from_block;       // Case block handling current state
+        uint64_t from_state;  // State value this block handles
+        uint64_t to_state;    // State value being written
+        int64_t var_offset;   // Which index variable is written
+    };
+
+    std::vector<transition_t> transitions;
+    std::map<int, std::vector<std::pair<uint64_t, int64_t>>> block_writes;
+
+    int total_writes_found = 0;
+    int sample_count = 0;
+    for (const auto &kv : disp.state_to_block) {
+        uint64_t state_val = kv.first;
+        int case_idx = kv.second;
+
+        mblock_t *case_blk = mba->get_mblock(case_idx);
+        if (!case_blk)
+            continue;
+
+        // Debug: log first few case blocks
+        if (sample_count < 5) {
+            int ins_count = 0;
+            for (minsn_t *p = case_blk->head; p; p = p->next) ins_count++;
+            deobf::log("[deflatten] Scanning case block %d (state 0x%llx), %d instructions\n",
+                      case_idx, (unsigned long long)state_val, ins_count);
+            for (minsn_t *ins = case_blk->head; ins && sample_count < 5; ins = ins->next) {
+                if (ins->opcode == m_mov) {
+                    deobf::log("[deflatten]   mov: src.t=%d dst.t=%d",
+                              ins->l.t, ins->d.t);
+                    if (ins->l.t == mop_n) {
+                        deobf::log(" src_val=%llu", (unsigned long long)ins->l.nnn->value);
+                    }
+                    if (ins->d.t == mop_S) {
+                        deobf::log(" dst_off=%lld", (long long)ins->d.s->off);
+                    }
+                    deobf::log("\n");
+                }
+            }
+            sample_count++;
+        }
+
+        auto writes = find_all_index_writes(case_blk, num_cases);
+        total_writes_found += writes.size();
+        block_writes[case_idx] = writes;
+
+        // Debug: show first few writes
+        static int write_debug_count = 0;
+        if (write_debug_count < 10 && !writes.empty()) {
+            deobf::log("[deflatten] Block %d writes:\n", case_idx);
+            for (const auto &w : writes) {
+                deobf::log("[deflatten]   val=%llu to offset=%lld (known=%s)\n",
+                          (unsigned long long)w.first, (long long)w.second,
+                          known_index_offsets.count(w.second) ? "YES" : "no");
+            }
+            write_debug_count++;
+        }
+
+        for (const auto &w : writes) {
+            // For now, count ALL small integer writes to stack vars
+            // In jump-table flattening, the state variable offsets may vary
+            // We'll filter more precisely later based on observed patterns
+            transition_t t;
+            t.from_block = case_idx;
+            t.from_state = state_val;
+            t.to_state = w.first;
+            t.var_offset = w.second;
+            transitions.push_back(t);
+
+            // Log if this IS a known index offset
+            if (known_index_offsets.count(w.second)) {
+                deobf::log("[deflatten] Matched known offset %lld\n", (long long)w.second);
+            }
+        }
+    }
+
+    deobf::log("[deflatten] Total small int writes found: %d (matched to known offsets: %zu)\n",
+              total_writes_found, transitions.size());
+
+    deobf::log("[deflatten] Found %zu state transitions across %zu case blocks\n",
+              transitions.size(), block_writes.size());
+
+    // Log some sample transitions
+    int logged = 0;
+    for (const auto &t : transitions) {
+        if (logged < 20) {
+            deobf::log("[deflatten] Transition: block %d (state 0x%llx) -> state 0x%llx (var off %lld)\n",
+                      t.from_block, (unsigned long long)t.from_state,
+                      (unsigned long long)t.to_state, (long long)t.var_offset);
+            logged++;
+        }
+    }
+
+    // If we found transitions, this confirms jump table flattening
+    if (!transitions.empty()) {
+        // Use the most commonly written index variable as the primary state var
+        std::map<int64_t, int> offset_counts;
+        for (const auto &t : transitions) {
+            offset_counts[t.var_offset]++;
+        }
+
+        int64_t best_offset = 0;
+        int best_count = 0;
+        for (const auto &kv : offset_counts) {
+            if (kv.second > best_count) {
+                best_count = kv.second;
+                best_offset = kv.first;
+            }
+        }
+
+        deobf::log("[deflatten] Primary index var offset: %lld (used in %d transitions)\n",
+                  (long long)best_offset, best_count);
+
+        // Set up the state variable
+        disp.state_var = z3_solver::symbolic_var_t(
+            z3_solver::symbolic_var_t::VAR_STACK,
+            (uint64_t)best_offset, 4);
+    } else if (!index_vars.empty()) {
+        // Fall back to using the first index variable
+        const index_var_info_t &primary_idx = index_vars[0];
+
+        z3_solver::symbolic_var_t::var_kind_t var_kind = z3_solver::symbolic_var_t::VAR_STACK;
+        uint64_t var_id = 0;
+        int var_size = primary_idx.var.size > 0 ? primary_idx.var.size : 4;
+
+        if (primary_idx.var.t == mop_S) {
+            var_kind = z3_solver::symbolic_var_t::VAR_STACK;
+            var_id = (uint64_t)primary_idx.var.s->off;
+        } else if (primary_idx.var.t == mop_l) {
+            var_kind = z3_solver::symbolic_var_t::VAR_LOCAL;
+            var_id = (uint64_t)primary_idx.var.l->idx;
+        }
+
+        disp.state_var = z3_solver::symbolic_var_t(var_kind, var_id, var_size);
+        deobf::log("[deflatten] Using fallback index var (kind=%d, id=%llu)\n",
+                  (int)var_kind, (unsigned long long)var_id);
+    }
+
+    // Mark all dispatcher-related blocks
+    disp.dispatcher_chain.insert(disp.block_idx);
+
+    // Add all blocks with indirect jumps to the same jump table
+    for (const auto& kv : switches) {
+        if (kv.second.jumps == primary_si.jumps) {
+            for (int i = 0; i < mba->qty; i++) {
+                mblock_t *blk = mba->get_mblock(i);
+                if (blk && blk->start <= kv.first && kv.first < blk->end) {
+                    disp.dispatcher_chain.insert(i);
+                }
+            }
+        }
+    }
+
+    deobf::log("[deflatten] Dispatcher chain has %zu blocks\n", disp.dispatcher_chain.size());
+
+    if (disp.state_to_block.size() >= 10) {
+        disp.is_solved = true;  // Mark as solved so trace_transitions_z3 will process it
+        dispatchers.push_back(disp);
+    }
+
+    return !dispatchers.empty();
+}
+
+//--------------------------------------------------------------------------
 // Analyze all dispatchers in the function using Z3
 //--------------------------------------------------------------------------
 std::vector<deflatten_handler_t::dispatcher_info_t>
@@ -229,11 +762,24 @@ deflatten_handler_t::analyze_dispatchers_z3(mbl_array_t *mba) {
     // Reset Z3 context for fresh analysis
     reset_global_context();
 
-    // First pass: find all potential dispatcher blocks
+    // First pass: find all potential dispatcher blocks (constant-based)
     for (int i = 0; i < mba->qty; i++) {
         dispatcher_info_t disp;
         if (analyze_dispatcher_block(mba, i, &disp)) {
             dispatchers.push_back(disp);
+        }
+    }
+
+    // If no constant-based dispatchers, try jump table-based analysis
+    if (dispatchers.empty()) {
+        deobf::log("[deflatten] No constant-based dispatchers, trying jump table analysis...\n");
+        if (analyze_jump_table_flattening(mba, dispatchers)) {
+            deobf::log("[deflatten] Jump table flattening detected with %zu dispatchers\n",
+                      dispatchers.size());
+            // For jump table flattening, we currently just log the detection
+            // Full deflattening would require tracing index variable assignments
+            // which is complex because there's no single "state variable"
+            return dispatchers;
         }
     }
 
@@ -537,6 +1083,139 @@ deflatten_handler_t::trace_transitions_z3(mbl_array_t *mba,
     deobf::log("[deflatten] Tracing transitions for dispatcher at block %d\n", disp.block_idx);
     deobf::log("[deflatten]   %zu case blocks to analyze\n", disp.case_blocks.size());
 
+    // Check if this is a jump-table style dispatcher (small integer states)
+    // If all state values in state_to_block are < 500, it's a jump-table dispatcher
+    bool is_jump_table = !disp.state_to_block.empty();
+    for (const auto &kv : disp.state_to_block) {
+        if (kv.first >= 500) {
+            is_jump_table = false;
+            break;
+        }
+    }
+    if (is_jump_table) {
+        deobf::log("[deflatten] Using jump-table tracing (small integer states)\n");
+
+        int max_cases = (int)disp.state_to_block.size();
+
+        // Build set of all case blocks for reference
+        std::set<int> case_blocks;
+        for (const auto &kv : disp.state_to_block) {
+            case_blocks.insert(kv.second);
+        }
+
+        // APPROACH: Find all blocks that write small integer values to stack
+        // and eventually flow to the dispatcher (directly or through ijmp blocks).
+        // These are the blocks where we need to redirect control flow.
+
+        // First, scan ALL blocks for small integer writes
+        std::map<int, std::vector<std::pair<uint64_t, int64_t>>> block_writes;
+        for (int blk_idx = 0; blk_idx < mba->qty; blk_idx++) {
+            mblock_t *blk = mba->get_mblock(blk_idx);
+            if (!blk) continue;
+
+            auto writes = find_all_index_writes(blk, max_cases);
+            if (!writes.empty()) {
+                block_writes[blk_idx] = writes;
+            }
+        }
+
+        deobf::log("[deflatten]   Found %zu blocks with index writes\n", block_writes.size());
+
+        // For each block that writes an index, check if it eventually leads to dispatcher
+        std::set<int> dispatcher_and_ijmp;
+        dispatcher_and_ijmp.insert(disp.dispatcher_chain.begin(), disp.dispatcher_chain.end());
+
+        // Also add ijmp blocks (blocks ending with m_ijmp are dispatcher entry points)
+        for (int blk_idx = 0; blk_idx < mba->qty; blk_idx++) {
+            mblock_t *blk = mba->get_mblock(blk_idx);
+            if (blk && blk->tail && blk->tail->opcode == m_ijmp) {
+                dispatcher_and_ijmp.insert(blk_idx);
+            }
+        }
+
+        for (const auto &bw : block_writes) {
+            int write_blk = bw.first;
+            const auto &writes = bw.second;
+
+            // Skip dispatcher chain blocks themselves
+            if (disp.dispatcher_chain.count(write_blk))
+                continue;
+
+            // Check if any successor (within 10 hops) is a dispatcher/ijmp block
+            // Also check if the block itself ends with ijmp/goto to dispatcher
+            bool leads_to_dispatcher = false;
+            mblock_t *wb = mba->get_mblock(write_blk);
+            if (wb && wb->tail) {
+                // If block ends with ijmp or goto, check target
+                if (wb->tail->opcode == m_ijmp) {
+                    leads_to_dispatcher = true;  // Block itself is an ijmp
+                } else if (wb->tail->opcode == m_goto && wb->nsucc() == 1) {
+                    int target = wb->succ(0);
+                    if (dispatcher_and_ijmp.count(target))
+                        leads_to_dispatcher = true;
+                }
+            }
+
+            if (!leads_to_dispatcher) {
+                std::set<int> visited;
+                std::vector<std::pair<int, int>> queue;
+                queue.push_back({write_blk, 0});
+
+                while (!queue.empty() && !leads_to_dispatcher) {
+                    auto [cur, depth] = queue.front();
+                    queue.erase(queue.begin());
+
+                    if (depth > 10 || visited.count(cur))
+                        continue;
+                    visited.insert(cur);
+
+                    mblock_t *blk = mba->get_mblock(cur);
+                    if (!blk) continue;
+
+                    for (int i = 0; i < blk->nsucc(); i++) {
+                        int succ = blk->succ(i);
+                        if (dispatcher_and_ijmp.count(succ)) {
+                            leads_to_dispatcher = true;
+                            break;
+                        }
+                        if (!visited.count(succ)) {
+                            queue.push_back({succ, depth + 1});
+                        }
+                    }
+                }
+            }
+
+            if (!leads_to_dispatcher)
+                continue;
+
+            // This block writes an index and leads to dispatcher - create edges
+            for (const auto &w : writes) {
+                uint64_t written_state = w.first;
+
+                auto it = disp.state_to_block.find(written_state);
+                if (it == disp.state_to_block.end())
+                    continue;
+
+                int target_blk = it->second;
+                if (write_blk == target_blk)
+                    continue;  // Skip self-loops
+
+                cfg_edge_t edge;
+                edge.from_block = write_blk;
+                edge.to_block = target_blk;
+                edge.state_value = written_state;
+                edge.is_conditional = false;
+                edges.push_back(edge);
+
+                deobf::log("[deflatten]   Write blk %d -> case %d (state 0x%llx)\n",
+                          write_blk, target_blk, (unsigned long long)written_state);
+            }
+        }
+
+        deobf::log("[deflatten]   Traced %zu jump-table transitions\n", edges.size());
+        return edges;
+    }
+
     // Build reverse map: state value -> case block that handles it
     std::map<uint64_t, int> state_to_case;
     for (const auto& kv : disp.state_to_block) {
@@ -772,6 +1451,170 @@ bool deflatten_handler_t::verify_cfg_safety(mbl_array_t *mba,
     return true;
 }
 
+// Forward declarations
+static bool convert_ijmp_to_goto(mbl_array_t *mba, int src_idx, int new_target);
+static bool redirect_unconditional_edge(mbl_array_t *mba, int src_idx, int new_target);
+
+//--------------------------------------------------------------------------
+// Helper: Trace through CFG to find the first ijmp block reachable from start
+// Uses BFS with depth limit to avoid infinite loops
+// Returns the block index of the ijmp block, or -1 if not found
+//--------------------------------------------------------------------------
+static int find_reachable_ijmp(mbl_array_t *mba, int start_block, int max_depth = 5) {
+    if (!mba || start_block < 0 || start_block >= mba->qty)
+        return -1;
+
+    std::set<int> visited;
+    std::vector<std::pair<int, int>> queue;  // (block_idx, depth)
+    queue.push_back({start_block, 0});
+
+    while (!queue.empty()) {
+        auto [blk_idx, depth] = queue.front();
+        queue.erase(queue.begin());
+
+        if (visited.count(blk_idx) || depth > max_depth)
+            continue;
+        visited.insert(blk_idx);
+
+        mblock_t *blk = mba->get_mblock(blk_idx);
+        if (!blk || !blk->tail)
+            continue;
+
+        // Found an ijmp block
+        if (blk->tail->opcode == m_ijmp) {
+            return blk_idx;
+        }
+
+        // Continue searching through successors
+        for (int i = 0; i < blk->nsucc(); i++) {
+            int succ = blk->succ(i);
+            if (!visited.count(succ)) {
+                queue.push_back({succ, depth + 1});
+            }
+        }
+    }
+
+    return -1;  // No ijmp found within depth limit
+}
+
+//--------------------------------------------------------------------------
+// Helper: Redirect a call block's fall-through to a new target
+// Strategy: Trace through the CFG to find the dispatcher (ijmp) block
+// and redirect it to the target. This handles arbitrary intermediate blocks.
+//--------------------------------------------------------------------------
+static bool redirect_call_fallthrough(mbl_array_t *mba, int src_idx, int new_target) {
+    if (!mba || src_idx < 0 || src_idx >= mba->qty || new_target < 0 || new_target >= mba->qty)
+        return false;
+
+    mblock_t *src = mba->get_mblock(src_idx);
+    mblock_t *dst = mba->get_mblock(new_target);
+    if (!src || !dst || !src->tail)
+        return false;
+
+    if (src->tail->opcode != m_call)
+        return false;
+
+    // Get the current fall-through target
+    int old_target = -1;
+    if (src->nsucc() > 0) {
+        old_target = src->succ(0);
+    }
+
+    if (old_target == new_target)
+        return true;  // Already pointing to the right place
+
+    // Trace through the CFG to find the dispatcher (ijmp) block
+    int ijmp_blk = find_reachable_ijmp(mba, old_target, 8);
+
+    if (ijmp_blk >= 0) {
+        deobf::log_verbose("[deflatten]   Found ijmp dispatcher at block %d via tracing from call succ %d\n",
+                  ijmp_blk, old_target);
+
+        // Convert the ijmp to goto
+        if (convert_ijmp_to_goto(mba, ijmp_blk, new_target)) {
+            return true;
+        }
+    }
+
+    // Check intermediate blocks for direct goto->ijmp patterns
+    if (old_target >= 0 && old_target < mba->qty) {
+        mblock_t *succ = mba->get_mblock(old_target);
+        if (succ && succ->tail) {
+            deobf::log_verbose("[deflatten]   Call succ block %d has tail op=%d\n",
+                      old_target, succ->tail->opcode);
+
+            if (succ->tail->opcode == m_ijmp) {
+                // The successor is a dispatcher block - convert it to goto
+                if (convert_ijmp_to_goto(mba, old_target, new_target)) {
+                    return true;
+                }
+            }
+            // Maybe the successor is a goto to a dispatcher
+            else if (succ->tail->opcode == m_goto && succ->nsucc() == 1) {
+                int next_blk = succ->succ(0);
+                if (next_blk >= 0 && next_blk < mba->qty) {
+                    mblock_t *next = mba->get_mblock(next_blk);
+                    if (next && next->tail && next->tail->opcode == m_ijmp) {
+                        // Chain: call -> goto -> ijmp
+                        // Redirect the goto
+                        if (redirect_unconditional_edge(mba, old_target, new_target)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return false;  // Can't safely redirect call blocks at this maturity
+}
+
+//--------------------------------------------------------------------------
+// Helper: Convert an ijmp block to a direct goto
+// ijmp format: ijmp segment, target_register
+// goto format: goto block_ref
+//--------------------------------------------------------------------------
+static bool convert_ijmp_to_goto(mbl_array_t *mba, int src_idx, int new_target) {
+    if (!mba || src_idx < 0 || src_idx >= mba->qty || new_target < 0 || new_target >= mba->qty)
+        return false;
+
+    mblock_t *src = mba->get_mblock(src_idx);
+    mblock_t *dst = mba->get_mblock(new_target);
+    if (!src || !dst || !src->tail)
+        return false;
+
+    minsn_t *tail = src->tail;
+    if (tail->opcode != m_ijmp)
+        return false;
+
+    // Convert the ijmp to goto by modifying in place
+    // This is safer than removing/inserting instructions
+    tail->opcode = m_goto;
+    tail->l.make_blkref(new_target);
+    tail->r.erase();  // Clear the right operand
+    tail->d.erase();  // Clear the destination operand
+
+    // ijmp blocks have no successors in the succset (computed jump)
+    // After conversion to goto, we need to add the target
+    src->succset.clear();
+    src->succset.push_back(new_target);
+
+    // Add src to dst's predset
+    auto it = std::find(dst->predset.begin(), dst->predset.end(), src_idx);
+    if (it == dst->predset.end()) {
+        dst->predset.push_back(src_idx);
+    }
+
+    // Set block type to 1-way (unconditional goto)
+    src->type = BLT_1WAY;
+
+    // Mark lists as dirty
+    src->mark_lists_dirty();
+    dst->mark_lists_dirty();
+
+    return true;
+}
+
 //--------------------------------------------------------------------------
 // Helper: Redirect a block's unconditional edge to a new target
 // This properly updates both the goto instruction AND the pred/succ lists
@@ -948,6 +1791,28 @@ int deflatten_handler_t::reconstruct_cfg_z3(mbl_array_t *mba,
                     ctx->branches_simplified++;
                 } else {
                     deobf::log("[deflatten]   Block %d: redirect_unconditional_edge failed\n",
+                              edge.from_block);
+                }
+            } else if (term_op == m_ijmp) {
+                // Indirect jump - convert to direct goto
+                if (convert_ijmp_to_goto(mba, edge.from_block, edge.to_block)) {
+                    deobf::log("[deflatten]   Block %d: ijmp -> goto blk%d\n",
+                              edge.from_block, edge.to_block);
+                    changes++;
+                    ctx->branches_simplified++;
+                } else {
+                    deobf::log("[deflatten]   Block %d: ijmp conversion failed\n",
+                              edge.from_block);
+                }
+            } else if (term_op == m_call && src->nsucc() == 1) {
+                // Call with fall-through - redirect to new target
+                if (redirect_call_fallthrough(mba, edge.from_block, edge.to_block)) {
+                    deobf::log("[deflatten]   Block %d: call fall-through -> blk%d\n",
+                              edge.from_block, edge.to_block);
+                    changes++;
+                    ctx->branches_simplified++;
+                } else {
+                    deobf::log("[deflatten]   Block %d: call fall-through redirect failed\n",
                               edge.from_block);
                 }
             } else if (deobf::is_jcc(term_op)) {
