@@ -105,9 +105,10 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
     // At maturity 3, the state machine patterns are still visible (switch/case
     // with state constants), but the CFG has explicit gotos that can be modified.
 
-    // Only process at MMAT_LOCOPT (3) - this is where CFG is stable but
-    // patterns are still visible
-    if (maturity != MMAT_LOCOPT)
+    // Process at multiple maturity levels
+    // MMAT_LOCOPT (3): CFG modifications
+    // MMAT_GLBOPT1 (5): Global constant inlining (addresses resolved)
+    if (maturity != MMAT_LOCOPT && maturity != MMAT_GLBOPT1)
         return 0;
 
     deobf_ctx_t ctx;
@@ -115,6 +116,16 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
     ctx.func_ea = func_ea;
 
     int total_changes = 0;
+
+    // Try global constant inlining - works better at later maturity when addresses resolved
+    if (maturity >= MMAT_LOCOPT && global_const_handler_t::detect(mba)) {
+        msg("[optblock] Detected global constants at maturity %d\n", maturity);
+        int changes = global_const_handler_t::run(mba, &ctx);
+        if (changes > 0) {
+            msg("[optblock] Global const handler applied %d changes\n", changes);
+            total_changes += changes;
+        }
+    }
 
     // Check for pending identity call analysis from maturity 0
     if (identity_call_handler_t::has_pending_analysis(func_ea)) {
@@ -180,8 +191,23 @@ int idaapi chernobog_t::func(mblock_t *blk, minsn_t *ins, int optflags) {
         return 0;
     }
 
+    // Debug: log ldx instructions (opcode 14)
+    if (ins->opcode == m_ldx) {
+        static int ldx_count = 0;
+        if (ldx_count < 20) {
+            ldx_count++;
+            deobf::log_verbose("[optinsn] m_ldx: r.t=%d\n", ins->r.t);
+        }
+    }
+
+    int changes = 0;
+
+    // Try global constant inlining
+    changes += global_const_handler_t::simplify_insn(blk, ins, nullptr);
+
     // Try MBA simplification on this instruction
-    int changes = mba_simplify_handler_t::simplify_insn(blk, ins, nullptr);
+    changes += mba_simplify_handler_t::simplify_insn(blk, ins, nullptr);
+
     return changes;
 }
 

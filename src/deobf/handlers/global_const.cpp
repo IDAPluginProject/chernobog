@@ -108,6 +108,7 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
     if (ins->opcode != m_mov && ins->opcode != m_ldx)
         return false;
 
+
     ea_t gv_addr = BADADDR;
     int size = 0;
     mop_t *gv_mop = nullptr;
@@ -125,6 +126,52 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
             gv_addr = ins->r.g;
             size = ins->d.size;
             gv_mop = &ins->r;
+        }
+        // Also check for address-of global: ldx dst, seg, &global
+        // At early maturity, globals may be wrapped in mop_a
+        else if (ins->r.t == mop_a && ins->r.a && ins->r.a->t == mop_v) {
+            gv_addr = ins->r.a->g;
+            size = ins->d.size;
+            gv_mop = ins->r.a;
+        }
+        // Check for immediate address (mop_n) which might be a global
+        else if (ins->r.t == mop_n) {
+            ea_t addr = (ea_t)ins->r.nnn->value;
+            // Verify it's a valid data address
+            if (getseg(addr) != nullptr) {
+                gv_addr = addr;
+                size = ins->d.size;
+                gv_mop = &ins->r;
+            }
+        }
+        // Check for computed address (mop_d) - result of add/sub with constants
+        // Pattern: ldx dst, seg, (base + offset) where base is a global address
+        else if (ins->r.t == mop_d && ins->r.d) {
+            minsn_t *addr_ins = ins->r.d;
+            // Check for add with constant offset: add result, base, offset
+            if (addr_ins->opcode == m_add) {
+                ea_t base_addr = BADADDR;
+                int64_t offset = 0;
+
+                // Check if left is global/number and right is number
+                if (addr_ins->l.t == mop_v) {
+                    base_addr = addr_ins->l.g;
+                } else if (addr_ins->l.t == mop_n) {
+                    base_addr = (ea_t)addr_ins->l.nnn->value;
+                } else if (addr_ins->l.t == mop_a && addr_ins->l.a && addr_ins->l.a->t == mop_v) {
+                    base_addr = addr_ins->l.a->g;
+                }
+
+                if (addr_ins->r.t == mop_n) {
+                    offset = addr_ins->r.nnn->value;
+                }
+
+                if (base_addr != BADADDR && getseg(base_addr) != nullptr) {
+                    gv_addr = base_addr + offset;
+                    size = ins->d.size;
+                    gv_mop = &ins->r;
+                }
+            }
         }
     }
 

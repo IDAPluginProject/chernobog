@@ -122,6 +122,7 @@ ida_add_plugin(chernobog
     src/deobf/handlers/objc_resolve.cpp
     src/deobf/handlers/global_const.cpp
     src/deobf/handlers/ptr_resolve.cpp
+    src/deobf/handlers/ctree_const_fold.cpp
 )
 
 # Link Z3 library

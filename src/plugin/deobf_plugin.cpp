@@ -6,6 +6,7 @@
 
 // Include component headers to trigger registration
 #include "../deobf/deobf_main.h"
+#include "../deobf/handlers/ctree_const_fold.h"
 
 #include <set>
 
@@ -97,6 +98,15 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
                 s_auto_deobfuscated.insert(func_ea);
                 chernobog_t::deobfuscate_mba(mba);
             }
+        }
+    }
+    // Apply ctree-level constant folding after decompilation
+    else if (event == hxe_maturity) {
+        cfunc_t *cfunc = va_arg(va, cfunc_t *);
+        ctree_maturity_t maturity = va_arg(va, ctree_maturity_t);
+        // Run at CMAT_FINAL when the ctree is complete
+        if (cfunc && maturity == CMAT_FINAL && is_auto_mode_enabled()) {
+            ctree_const_fold_handler_t::run(cfunc);
         }
     }
     return 0;

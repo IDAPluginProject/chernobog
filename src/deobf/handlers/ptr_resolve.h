@@ -40,6 +40,8 @@ private:
         qstring target_name;    // Name of the target (_OBJC_CLASS_$_...)
         bool is_objc_class;     // Is this an ObjC class reference?
         qstring class_name;     // Extracted class name (without prefix)
+        bool is_cfstring;       // Is this a CFConstantString?
+        qstring string_value;   // Extracted string content for CFConstantStrings
     };
 
     // Find all indirect pointer references
@@ -56,6 +58,9 @@ private:
 
     // Extract class name from ObjC symbol
     static bool extract_objc_class_name(const char *symbol, qstring *out_class);
+
+    // Check if address is a CFConstantString struct and extract its content
+    static bool try_extract_cfstring(ea_t struct_addr, qstring *out_string);
 
     // Annotate the resolved reference
     static void annotate_ptr_ref(const ptr_ref_t &ref);
