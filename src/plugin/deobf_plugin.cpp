@@ -104,10 +104,6 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
         }
     }
     // Apply ctree-level constant folding after decompilation
-    // DISABLED: Modifying ctree at CMAT_FINAL is unsafe - needs proper
-    // cexpr_t replacement (cleanup, type handling, etc.)
-    // TODO: Fix ctree_const_fold to use proper Hex-Rays ctree modification APIs
-    /*
     else if (event == hxe_maturity) {
         cfunc_t *cfunc = va_arg(va, cfunc_t *);
         ctree_maturity_t maturity = va_argi(va, ctree_maturity_t);
@@ -121,7 +117,6 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
             }
         }
     }
-    */
     return 0;
 }
 

@@ -5,12 +5,17 @@
 //--------------------------------------------------------------------------
 struct const_fold_visitor_t : public ctree_visitor_t {
     int changes = 0;
+    cfunc_t *func = nullptr;
 
-    const_fold_visitor_t() : ctree_visitor_t(CV_PARENTS) {}
+    const_fold_visitor_t(cfunc_t *f) : ctree_visitor_t(CV_PARENTS), func(f) {}
 
     int idaapi visit_expr(cexpr_t *e) override {
         // Look for XOR expressions
         if (e->op != cot_xor)
+            return 0;
+
+        // Need both operands
+        if (!e->x || !e->y)
             return 0;
 
         // One operand must be a number constant
@@ -19,14 +24,6 @@ struct const_fold_visitor_t : public ctree_visitor_t {
 
         cexpr_t *val_expr = (e->y->op == cot_num) ? e->x : e->y;
         cexpr_t *num_expr = (e->y->op == cot_num) ? e->y : e->x;
-
-        // Debug: show what we're dealing with
-        static int xor_count = 0;
-        if (xor_count < 20) {
-            xor_count++;
-            deobf::log_verbose("[ctree_const_fold] XOR: val.op=%d num=0x%llx\n",
-                              val_expr->op, (unsigned long long)num_expr->numval());
-        }
 
         // Try to get a global address from the value expression
         ea_t obj_addr = BADADDR;
@@ -54,9 +51,14 @@ struct const_fold_visitor_t : public ctree_visitor_t {
         if (obj_addr == BADADDR)
             return 0;
 
-        // Check if it's a byte/word/dword in a data section
+        // Check if the address is in a valid segment
+        segment_t *seg = getseg(obj_addr);
+        if (!seg)
+            return 0;
+
+        // Check if it's a data location
         flags64_t flags = get_flags(obj_addr);
-        if (!is_data(flags))
+        if (!is_loaded(obj_addr))
             return 0;
 
         // Read the value based on size
@@ -79,16 +81,27 @@ struct const_fold_visitor_t : public ctree_visitor_t {
         // Compute the XOR
         uint64_t result = obj_val ^ const_val;
 
-        deobf::log_verbose("[ctree_const_fold] Folding %a ^ 0x%llx = 0x%llx\n",
-                          obj_addr, (unsigned long long)const_val,
-                          (unsigned long long)result);
+        deobf::log("[ctree_const_fold] Folding %a ^ 0x%llx = 0x%llx\n",
+                   obj_addr, (unsigned long long)const_val,
+                   (unsigned long long)result);
 
-        // Replace the expression with the constant result
+        // Properly replace the expression with the constant result
+        // First, clean up the old operands
+        delete e->x;
+        delete e->y;
+        e->x = nullptr;
+        e->y = nullptr;
+
+        // Now make this a number expression
         e->op = cot_num;
         e->n = new cnumber_t();
         e->n->_value = result;
-        e->x = nullptr;
-        e->y = nullptr;
+        e->n->nf.flags = 0;
+        e->n->nf.opnum = 0;
+        e->n->nf.props = 0;
+        e->n->nf.serial = 0;
+        e->n->nf.org_nbytes = size;
+        e->n->nf.type_name.clear();
 
         changes++;
         return 0;
@@ -104,7 +117,7 @@ int ctree_const_fold_handler_t::run(cfunc_t *cfunc) {
 
     deobf::log_verbose("[ctree_const_fold] Running on %a\n", cfunc->entry_ea);
 
-    const_fold_visitor_t visitor;
+    const_fold_visitor_t visitor(cfunc);
     visitor.apply_to(&cfunc->body, nullptr);
 
     if (visitor.changes > 0) {
