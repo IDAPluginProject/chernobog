@@ -178,8 +178,11 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
         cswitch_t *sw = ins->cswitch;
         cexpr_t *switch_expr = &sw->expr;
 
-        deobf::log_verbose("[ctree_switch_fold] Found switch at %a with %zu cases\n",
+        deobf::log("[ctree_switch_fold] Found switch at %a with %zu cases\n",
                   ins->ea, sw->cases.size());
+
+        // Debug: log switch expression type
+        deobf::log_verbose("[ctree_switch_fold] Switch expr op=%d\n", switch_expr->op);
 
         uint64_t const_val = 0;
         bool is_constant = false;
@@ -189,6 +192,22 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
             is_constant = true;
             deobf::log("[ctree_switch_fold] Switch expression is constant: 0x%llx\n",
                       (unsigned long long)const_val);
+        }
+
+        // Check for (cast)&object pattern - this is a constant address
+        // Pattern: cot_cast(cot_ref(cot_obj))
+        if (!is_constant && switch_expr->op == cot_cast && switch_expr->x) {
+            cexpr_t *inner = switch_expr->x;
+            if (inner->op == cot_ref && inner->x && inner->x->op == cot_obj) {
+                // This is &object - get the object address
+                ea_t obj_addr = inner->x->obj_ea;
+                if (obj_addr != BADADDR) {
+                    const_val = (uint64_t)obj_addr;
+                    is_constant = true;
+                    deobf::log("[ctree_switch_fold] Switch on &object: addr 0x%llx\n",
+                              (unsigned long long)const_val);
+                }
+            }
         }
 
         // Check for HIDWORD pattern with constant

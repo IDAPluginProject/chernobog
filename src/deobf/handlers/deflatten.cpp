@@ -508,6 +508,165 @@ find_all_index_writes(mblock_t *blk, int max_value = 300) {
 }
 
 //--------------------------------------------------------------------------
+// Trace backward from an ijmp block to find the constant state value
+// that will be used as the index. Returns the state value, or -1 if not found.
+//
+// This performs backward dataflow analysis within the block and across
+// predecessor blocks (up to a depth limit) to resolve the index value.
+//
+// For stack variables, we look for:
+//   mov #const, [sp+offset]   or   stx #const, offset, sp
+// where offset matches the index variable's stack offset.
+//--------------------------------------------------------------------------
+static int64_t trace_ijmp_state_value(mbl_array_t *mba, int ijmp_blk_idx,
+                                       const mop_t &index_var, int max_depth = 3) {
+    if (!mba || ijmp_blk_idx < 0 || ijmp_blk_idx >= mba->qty)
+        return -1;
+
+    // Get the stack offset we're looking for (if stack variable)
+    int64_t target_stack_off = -1;
+    if (index_var.t == mop_S && index_var.s) {
+        target_stack_off = index_var.s->off;
+    }
+
+    // Stack for blocks to analyze: (block_idx, depth)
+    std::vector<std::pair<int, int>> worklist;
+    std::set<int> visited;
+    worklist.push_back({ijmp_blk_idx, 0});
+
+    while (!worklist.empty()) {
+        auto [blk_idx, depth] = worklist.back();
+        worklist.pop_back();
+
+        if (visited.count(blk_idx) || depth > max_depth)
+            continue;
+        visited.insert(blk_idx);
+
+        mblock_t *blk = mba->get_mblock(blk_idx);
+        if (!blk)
+            continue;
+
+        // Track register values as we scan backward
+        std::map<mreg_t, int64_t> reg_values;
+
+        // Scan instructions in reverse order
+        for (minsn_t *ins = blk->tail; ins; ins = ins->prev) {
+            // Check for mov of constant to index variable (direct match)
+            if (ins->opcode == m_mov && ins->l.t == mop_n) {
+                int64_t val = (int64_t)ins->l.nnn->value;
+                bool matches = false;
+
+                // Check if destination matches index variable
+                if (ins->d.t == index_var.t) {
+                    if (index_var.t == mop_S && ins->d.s && index_var.s) {
+                        matches = (ins->d.s->off == index_var.s->off);
+                    } else if (index_var.t == mop_l && ins->d.l && index_var.l) {
+                        matches = (ins->d.l->idx == index_var.l->idx);
+                    } else if (index_var.t == mop_r) {
+                        matches = (ins->d.r == index_var.r);
+                    }
+                }
+
+                if (matches && val >= 0 && val < 300) {
+                    return val;
+                }
+            }
+
+            // Check for stx (store) to stack - stx src, offset, base
+            // This handles: stx #const, offset, sp -> stores const to [sp+offset]
+            if (ins->opcode == m_stx && target_stack_off >= 0) {
+                // Check if storing to the right stack location
+                // stx format: l=source, r=offset, d=base
+                if (ins->r.t == mop_n && ins->d.t == mop_r) {
+                    int64_t offset = (int64_t)ins->r.nnn->value;
+                    // Check if this matches our target stack offset (approximately)
+                    if (offset == target_stack_off ||
+                        (offset >= target_stack_off - 8 && offset <= target_stack_off + 8)) {
+                        // Check source
+                        if (ins->l.t == mop_n) {
+                            int64_t val = (int64_t)ins->l.nnn->value;
+                            if (val >= 0 && val < 300) {
+                                return val;
+                            }
+                        } else if (ins->l.t == mop_r) {
+                            auto it = reg_values.find(ins->l.r);
+                            if (it != reg_values.end() && it->second >= 0) {
+                                return it->second;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check for mov from register to index variable
+            if (ins->opcode == m_mov && ins->l.t == mop_r && ins->d.t == index_var.t) {
+                bool matches = false;
+                if (index_var.t == mop_S && ins->d.s && index_var.s) {
+                    matches = (ins->d.s->off == index_var.s->off);
+                } else if (index_var.t == mop_l && ins->d.l && index_var.l) {
+                    matches = (ins->d.l->idx == index_var.l->idx);
+                }
+
+                if (matches) {
+                    auto it = reg_values.find(ins->l.r);
+                    if (it != reg_values.end() && it->second >= 0) {
+                        return it->second;
+                    }
+                }
+            }
+
+            // Track register constant assignments (scanning backwards)
+            if (ins->opcode == m_mov && ins->d.t == mop_r) {
+                if (ins->l.t == mop_n) {
+                    int64_t val = (int64_t)ins->l.nnn->value;
+                    if (val >= 0 && val < 300) {
+                        reg_values[ins->d.r] = val;
+                    }
+                } else if (ins->l.t == mop_r) {
+                    // Register copy
+                    auto it = reg_values.find(ins->l.r);
+                    if (it != reg_values.end()) {
+                        reg_values[ins->d.r] = it->second;
+                    }
+                }
+            }
+
+            // Handle xdu/xds (zero/sign extension)
+            if ((ins->opcode == m_xdu || ins->opcode == m_xds) && ins->d.t == mop_r) {
+                if (ins->l.t == mop_n) {
+                    int64_t val = (int64_t)ins->l.nnn->value;
+                    if (val >= 0 && val < 300) {
+                        reg_values[ins->d.r] = val;
+                    }
+                }
+            }
+        }
+
+        // If not found in this block, check predecessors
+        // For single-predecessor blocks, always continue
+        // For multi-predecessor blocks, only continue for a few levels (the value may differ)
+        if (depth < max_depth) {
+            if (blk->npred() == 1) {
+                int pred = blk->pred(0);
+                if (!visited.count(pred)) {
+                    worklist.push_back({pred, depth + 1});
+                }
+            } else if (depth < 2) {
+                // For multi-predecessor within first 2 levels, try all paths
+                for (int i = 0; i < blk->npred(); i++) {
+                    int pred = blk->pred(i);
+                    if (!visited.count(pred)) {
+                        worklist.push_back({pred, depth + 1});
+                    }
+                }
+            }
+        }
+    }
+
+    return -1;  // Not found
+}
+
+//--------------------------------------------------------------------------
 // Analyze jump table-based flattening (index-based, not magic constants)
 // Returns true if this appears to be jump table flattening
 //--------------------------------------------------------------------------
@@ -1362,7 +1521,69 @@ deflatten_handler_t::trace_transitions_z3(mbl_array_t *mba,
             }
         }
 
-        deobf::log("[deflatten]   Traced %zu jump-table transitions\n", edges.size());
+        // ENHANCED: For each ijmp block, try to resolve its target using backward tracing
+        // This handles cases where the state write is not immediately before the ijmp
+        int ijmp_resolved = 0;
+        std::set<int> already_has_edge;
+        for (const auto &e : edges) {
+            already_has_edge.insert(e.from_block);
+        }
+
+        for (int blk_idx = 0; blk_idx < mba->qty; blk_idx++) {
+            // Skip blocks that already have edges
+            if (already_has_edge.count(blk_idx))
+                continue;
+
+            mblock_t *blk = mba->get_mblock(blk_idx);
+            if (!blk || !blk->tail || blk->tail->opcode != m_ijmp)
+                continue;
+
+            // Skip dispatcher chain blocks
+            if (disp.dispatcher_chain.count(blk_idx))
+                continue;
+
+            // Find the index variable for this ijmp
+            index_var_info_t idx_info;
+            if (!find_index_variable(blk, &idx_info)) {
+                deobf::log_verbose("[deflatten]   ijmp blk %d: no index var found\n", blk_idx);
+                continue;
+            }
+
+            // Trace backward to find the state value
+            int64_t state_val = trace_ijmp_state_value(mba, blk_idx, idx_info.var, 5);
+            if (state_val < 0 || state_val >= max_cases) {
+                deobf::log_verbose("[deflatten]   ijmp blk %d: state trace failed (val=%lld)\n",
+                          blk_idx, (long long)state_val);
+                continue;
+            }
+
+            // Look up the target block
+            auto it = disp.state_to_block.find((uint64_t)state_val);
+            if (it == disp.state_to_block.end())
+                continue;
+
+            int target_blk = it->second;
+            if (target_blk == blk_idx)
+                continue;  // Skip self-loops
+
+            cfg_edge_t edge;
+            edge.from_block = blk_idx;
+            edge.to_block = target_blk;
+            edge.state_value = (uint64_t)state_val;
+            edge.is_conditional = false;
+            edges.push_back(edge);
+            ijmp_resolved++;
+
+            deobf::log("[deflatten]   ijmp blk %d traced -> case %d (state %lld)\n",
+                      blk_idx, target_blk, (long long)state_val);
+        }
+
+        if (ijmp_resolved > 0) {
+            deobf::log("[deflatten]   Resolved %d additional ijmp blocks via backward tracing\n",
+                      ijmp_resolved);
+        }
+
+        deobf::log("[deflatten]   Traced %zu jump-table transitions total\n", edges.size());
         return edges;
     }
 
@@ -2138,12 +2359,12 @@ int deflatten_handler_t::cleanup_dispatcher(mbl_array_t *mba,
 
     int removed = 0;
 
-    // Try to eliminate the dispatcher jtbl instruction by converting to goto.
-    // This is safe if the edges have been successfully redirected, since each
-    // case block now goes directly to its target instead of through the dispatcher.
-    // Converting the jtbl to goto pointing to the initial case eliminates the
-    // switch statement from the decompiled output.
-    removed += eliminate_dispatcher_switches(mba, disp);
+    // Note: For jump-table based flattening, we do NOT call eliminate_dispatcher_switches
+    // because the switch cases contain the actual function logic. The switch itself
+    // is the control flow - we can only remove obfuscation around it, not the switch.
+    // For constant-based dispatchers (Hikari magic constants), the case blocks redirect
+    // to real targets and the dispatcher could be eliminated, but that requires all
+    // edges to be successfully redirected first.
 
     // Mark dispatcher chain blocks for removal
     // Note: IDA's microcode framework doesn't support direct block removal,
