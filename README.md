@@ -1,8 +1,18 @@
-# Chernobog
+<h1 align="center">chernobog</h1>
 
-**Chernobog** is a Hex-Rays IDA Pro plugin for deobfuscating binaries protected with the [Hikari](https://github.com/HikariObfuscator/Hikari) LLVM obfuscator.
+<img width="1536" height="597" alt="chernobog" src="hero.png" />
 
-> *In Slavic mythology, Chernobog (meaning "black god") is a deity of darkness - the natural counterpart to Hikari, which means "light" in Japanese.*
+---
+
+<h5 align="center">
+chernobog is a Hex-Rays decompiler plugin that defeats Hikari LLVM obfuscation.<br/>
+Where IDA shows tangled switch dispatchers, chernobog restores the original control flow.<br/>
+Flattening, bogus branches, encrypted strings—all reversed automatically.<br/>
+<br/>
+Opaque predicates evaluated. Dead code eliminated. Constants decrypted in place.<br/>
+Instruction substitutions simplified back to their obvious forms.<br/>
+The obfuscation dissolves. The algorithm emerges.
+</h5>
 
 ## Features
 
