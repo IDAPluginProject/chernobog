@@ -35,8 +35,13 @@ bool deflatten_handler_t::detect(mbl_array_t *mba, deobf_ctx_t *ctx) {
 
 //--------------------------------------------------------------------------
 // Utility: Check if value is a Hikari state constant
+// NOTE: Some obfuscators use non-standard patterns. We now accept:
+//   1. Magic patterns (0xDEAD, 0xBEEF, etc.) - classic Hikari
+//   2. Any large 32-bit constant that appears repeatedly in comparisons
+//      (detected contextually, not just by pattern)
 //--------------------------------------------------------------------------
 bool deflatten_handler_t::is_state_constant(uint64_t val) {
+    // Must be a 32-bit value in the "suspicious" range
     if (val < 0x10000000 || val > 0xFFFFFFFF)
         return false;
 
@@ -44,6 +49,7 @@ bool deflatten_handler_t::is_state_constant(uint64_t val) {
     if (high == 0)
         return false;
 
+    // Classic Hikari magic patterns
     switch (high) {
         case 0xAAAA: case 0xABCD: case 0xBBBB: case 0xCCCC: case 0xDDDD:
         case 0xBEEF: case 0xCAFE: case 0xDEAD:
@@ -52,8 +58,38 @@ bool deflatten_handler_t::is_state_constant(uint64_t val) {
         case 0xFEED: case 0xFACE: case 0xBABE: case 0xC0DE: case 0xF00D:
             return true;
         default:
-            return false;
+            break;
     }
+
+    // Extended patterns: accept any value that looks like a state constant
+    // These are typically:
+    // - Large enough to not be a small index (>= 0x10000000)
+    // - Not a typical address (addresses are usually > 0x100000000 on 64-bit)
+    // - Have high entropy in both halves (not like 0x00001234 or 0x12340000)
+    
+    uint16_t low = val & 0xFFFF;
+    
+    // Both halves should have some bits set (entropy check)
+    // This filters out values like 0x12340000 or 0x00001234
+    if (low == 0 || high == 0)
+        return false;
+    
+    // Avoid values that look like shifted addresses or offsets
+    // Typical code/data addresses on macOS are 0x100000000+
+    // Small offsets would be < 0x10000000
+    if (val >= 0x100000000ULL)
+        return false;
+    
+    // Accept as potential state constant if it has entropy in both halves
+    // Count set bits - genuine state constants tend to have moderate bit density
+    int bit_count = __builtin_popcount((uint32_t)val);
+    
+    // State constants typically have 8-24 bits set (not all 0s or all 1s)
+    if (bit_count >= 6 && bit_count <= 26) {
+        return true;
+    }
+    
+    return false;
 }
 
 //--------------------------------------------------------------------------
@@ -2063,11 +2099,24 @@ static bool convert_jtbl_to_goto(mbl_array_t *mba, int src_idx, int new_target) 
 // IMPORTANT: Only converts the PRIMARY dispatcher block's jtbl, not all jtbl
 // blocks in the chain. This preserves control flow while eliminating the
 // main dispatcher switch.
+//
+// SAFETY: This function should ONLY be called after successful CFG reconstruction
+// with verified transitions. Converting a dispatcher without proper edge
+// redirection will make the function body unreachable!
 //--------------------------------------------------------------------------
 static int eliminate_dispatcher_switches(mbl_array_t *mba,
-                                         const deflatten_handler_t::dispatcher_info_t &disp) {
+                                         const deflatten_handler_t::dispatcher_info_t &disp,
+                                         int num_redirected_edges) {
     if (!mba)
         return 0;
+
+    // CRITICAL SAFEGUARD: Never eliminate dispatcher if we haven't redirected any edges!
+    // Otherwise the function body becomes unreachable and decompiles to just "jmp r15"
+    if (num_redirected_edges < 3) {
+        deobf::log("[deflatten] SAFEGUARD: Not eliminating dispatcher - only %d edges redirected (need >= 3)\n",
+                  num_redirected_edges);
+        return 0;
+    }
 
     // The dispatcher block index should be the primary entry point
     int dispatcher_blk = disp.block_idx;
@@ -2243,6 +2292,10 @@ static bool redirect_conditional_edge(mbl_array_t *mba, int src_idx, int new_tar
 //--------------------------------------------------------------------------
 // Reconstruct CFG by patching branch targets
 // Uses the helper functions that properly update predset/succset lists
+//
+// SAFETY: This function includes safeguards to prevent making the CFG worse.
+// If we don't have enough transitions traced, we skip reconstruction to avoid
+// turning the function into unreachable code (e.g., just "jmp r15").
 //--------------------------------------------------------------------------
 int deflatten_handler_t::reconstruct_cfg_z3(mbl_array_t *mba,
                                              const std::vector<cfg_edge_t> &edges,
@@ -2253,6 +2306,25 @@ int deflatten_handler_t::reconstruct_cfg_z3(mbl_array_t *mba,
 
     if (!verify_cfg_safety(mba, edges)) {
         deobf::log("[deflatten] CFG safety check failed, aborting reconstruction\n");
+        return 0;
+    }
+
+    // CRITICAL SAFEGUARD: Check that we have enough transitions to justify CFG modification
+    // A properly deflattened function should have transitions for most case blocks.
+    // If we only traced a few edges, we likely missed most transitions and shouldn't
+    // modify the CFG at all - doing so would make the function body unreachable.
+    size_t min_required_edges = 0;
+    if (disp.case_blocks.size() > 0) {
+        // Require at least 30% of case blocks to have outgoing transitions
+        min_required_edges = std::max((size_t)3, disp.case_blocks.size() / 3);
+    } else {
+        min_required_edges = 3;
+    }
+    
+    if (edges.size() < min_required_edges) {
+        deobf::log("[deflatten] SAFEGUARD: Only %zu edges traced but %zu required (case_blocks=%zu)\n",
+                  edges.size(), min_required_edges, disp.case_blocks.size());
+        deobf::log("[deflatten] Skipping CFG reconstruction to avoid breaking function\n");
         return 0;
     }
 

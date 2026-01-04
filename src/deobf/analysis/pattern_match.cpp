@@ -99,6 +99,7 @@ bool is_always_false(minsn_t *insn) {
 // Control flow flattening detection
 //--------------------------------------------------------------------------
 // Helper: Check if a value looks like a Hikari state constant
+// NOTE: Extended to handle non-magic constant patterns used by some obfuscators
 //--------------------------------------------------------------------------
 static bool is_hikari_state_const(uint64_t val) {
     // Hikari uses distinctive patterns for state constants
@@ -111,11 +112,11 @@ static bool is_hikari_state_const(uint64_t val) {
 
     uint32_t high = (val >> 16) & 0xFFFF;
 
-    // The high part must be non-zero and match a known pattern
+    // The high part must be non-zero
     if (high == 0)
         return false;
 
-    // Check for known Hikari patterns
+    // Check for known Hikari patterns (classic)
     switch (high) {
         case 0xAAAA:
         case 0xABCD:  // Common Hikari pattern (0xABCD0001, 0xABCD0002, etc.)
@@ -142,6 +143,24 @@ static bool is_hikari_state_const(uint64_t val) {
             return true;
         default:
             break;
+    }
+
+    // Extended detection: accept any 32-bit value with entropy in both halves
+    // This catches non-standard obfuscators that use random-looking constants
+    uint16_t low = val & 0xFFFF;
+    
+    // Both halves should have some bits set
+    if (low == 0)
+        return false;
+    
+    // Avoid 64-bit addresses
+    if (val >= 0x100000000ULL)
+        return false;
+    
+    // Check bit density - state constants typically have 6-26 bits set
+    int bit_count = __builtin_popcount((uint32_t)val);
+    if (bit_count >= 6 && bit_count <= 26) {
+        return true;
     }
 
     return false;
