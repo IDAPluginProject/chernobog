@@ -18,6 +18,7 @@
 #include "handlers/objc_resolve.h"
 #include "handlers/global_const.h"
 #include "handlers/ptr_resolve.h"
+#include "handlers/indirect_call.h"
 #include "analysis/ast_builder.h"
 #include "rules/rule_registry.h"
 
@@ -61,14 +62,44 @@ void chernobog_clear_all_tracking() {
 }
 
 //--------------------------------------------------------------------------
+// File-based debug logging for optblock
+//--------------------------------------------------------------------------
+#include <fcntl.h>
+#include <unistd.h>
+
+static void optblock_debug(const char *fmt, ...) {
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    int len = qvsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    
+    int fd = open("/tmp/optblock_debug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, buf, len);
+        close(fd);
+    }
+}
+
+//--------------------------------------------------------------------------
 // Block-level optimizer callback - runs at various maturity levels
 //--------------------------------------------------------------------------
 int idaapi chernobog_optblock_t::func(mblock_t *blk) {
+    optblock_debug("[optblock] func() called\n");
+    
     // Debug: log every call to see if we're being invoked
     if (!blk || !blk->mba) {
+        optblock_debug("[optblock] null blk or mba!\n");
         msg("[optblock] Called with null blk or mba\n");
         return 0;
     }
+
+    int maturity = blk->mba->maturity;
+    optblock_debug("[optblock] s_active=%d, entry_ea=%llx, maturity=%d, blk=%d\n", 
+                   chernobog_t::s_active ? 1 : 0, 
+                   (unsigned long long)blk->mba->entry_ea,
+                   maturity,
+                   blk->serial);
 
     if (!chernobog_t::s_active) {
         // Only log once per function to avoid spam
@@ -82,18 +113,37 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
 
     mbl_array_t *mba = blk->mba;
     ea_t func_ea = mba->entry_ea;
-    int maturity = mba->maturity;
+    // maturity already declared above
 
     // Track which function+maturity combinations we've processed to avoid duplicate work
     // Key: (func_ea << 4) | maturity (assuming maturity < 16)
     // Uses global set that can be cleared to allow re-deobfuscation
     uint64_t key = ((uint64_t)func_ea << 4) | (maturity & 0xF);
 
-    if (s_optblock_processed.count(key))
+    if (s_optblock_processed.count(key)) {
+        optblock_debug("[optblock] Already processed key=%llx\n", (unsigned long long)key);
         return 0;
+    }
     s_optblock_processed.insert(key);
 
+    optblock_debug("[optblock] NEW processing: maturity=%d, func=%llx\n", maturity, (unsigned long long)func_ea);
     msg("[optblock] Processing %a at maturity %d (blk %d)\n", func_ea, maturity, blk->serial);
+
+    // Run full deobfuscation at maturity 3 (MMAT_LOCOPT) - first opportunity for CFG mods
+    if (maturity == MMAT_LOCOPT) {
+        optblock_debug("[optblock] Running FULL deobfuscation passes at maturity 3\n");
+        deobf_ctx_t full_ctx;
+        full_ctx.mba = mba;
+        full_ctx.func_ea = func_ea;
+        
+        // First detect what obfuscations are present
+        full_ctx.detected_obf = chernobog_t::detect_obfuscations(mba);
+        optblock_debug("[optblock] Detected obfuscations: 0x%x\n", full_ctx.detected_obf);
+        
+        run_deobfuscation_passes(mba, &full_ctx);
+        optblock_debug("[optblock] Full deobfuscation complete, changes: blocks=%d, branches=%d, indirect=%d\n",
+                       full_ctx.blocks_merged, full_ctx.branches_simplified, full_ctx.indirect_resolved);
+    }
 
     // Two-phase deflattening approach:
     //
@@ -290,6 +340,9 @@ static void run_deobfuscation_passes(mbl_array_t *mba, deobf_ctx_t *ctx) {
     if (ctx->detected_obf & OBF_PTR_INDIRECT) {
         deobf::log("[chernobog] - Indirect pointer references detected\n");
     }
+    if (ctx->detected_obf & OBF_INDIRECT_CALL) {
+        deobf::log("[chernobog] - Indirect call obfuscation detected\n");
+    }
 
     // Initialize stack tracker for virtual stack analysis
     stack_tracker_t::analyze_function(mba);
@@ -335,6 +388,11 @@ static void run_deobfuscation_passes(mbl_array_t *mba, deobf_ctx_t *ctx) {
     // 5. Resolve indirect branches
     if (ctx->detected_obf & OBF_INDIRECT_BR) {
         total_changes += chernobog_t::resolve_indirect_branches(mba, ctx);
+    }
+
+    // 5.1. Resolve indirect calls (Hikari IndirectCall obfuscation)
+    if (ctx->detected_obf & OBF_INDIRECT_CALL) {
+        total_changes += indirect_call_handler_t::run(mba, ctx);
     }
 
     // 5.5. Resolve identity function calls
@@ -437,6 +495,7 @@ void chernobog_t::analyze_function(ea_t ea) {
     if (obf & OBF_OBJC_OBFUSC) msg("  - Obfuscated ObjC method calls\n");
     if (obf & OBF_GLOBAL_CONST) msg("  - Inlinable global constants\n");
     if (obf & OBF_PTR_INDIRECT) msg("  - Indirect pointer references\n");
+    if (obf & OBF_INDIRECT_CALL) msg("  - Indirect call obfuscation (Hikari)\n");
     if (obf == OBF_NONE) msg("  - No obfuscation detected\n");
 }
 
@@ -502,6 +561,10 @@ uint32_t chernobog_t::detect_obfuscations(mbl_array_t *mba) {
     // Check for indirect pointer references
     if (ptr_resolve_handler_t::detect(mba))
         detected |= OBF_PTR_INDIRECT;
+
+    // Check for indirect call obfuscation (Hikari IndirectCall)
+    if (indirect_call_handler_t::detect(mba))
+        detected |= OBF_INDIRECT_CALL;
 
     return detected;
 }
@@ -582,7 +645,7 @@ void deobf_init() {
     install_optblock_handler(g_optblock);
 
     chernobog_t::s_active = true;
-    deobf::log("[chernobog] Deobfuscator initialized (optinsn + optblock handlers)\n");
+    msg("[chernobog] Deobfuscator initialized (optinsn + optblock handlers, s_active=true)\n");
 }
 
 void deobf_done() {

@@ -8,8 +8,42 @@
 #include "../deobf/deobf_main.h"
 #include "../deobf/handlers/ctree_const_fold.h"
 #include "../deobf/handlers/ctree_switch_fold.h"
+#include "../deobf/handlers/ctree_indirect_call.h"
 
 #include <set>
+#include <cstdio>
+
+// Debug file logging for batch mode where msg() might not be visible
+// Using raw syscalls to bypass IDA's file wrappers
+#include <fcntl.h>
+#include <unistd.h>
+
+static void debug_log(const char *fmt, ...) {
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    int len = qvsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    
+    int fd = open("/tmp/chernobog_debug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, buf, len);
+        close(fd);
+    }
+}
+
+// Global constructor to trace when dylib is loaded
+__attribute__((constructor))
+static void dylib_loaded() {
+    // Write directly to a marker file to prove we loaded
+    int fd = open("/tmp/CHERNOBOG_LOADED", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char *msg = "DYLIB LOADED\n";
+        write(fd, msg, 13);
+        close(fd);
+    }
+    debug_log("[chernobog] DYLIB LOADED (constructor called)\n");
+}
 
 // Track which functions we've already auto-deobfuscated to avoid infinite loops
 static std::set<ea_t> s_auto_deobfuscated;
@@ -19,6 +53,9 @@ static std::set<ea_t> s_ctree_const_folded;
 
 // Track which functions we've already run ctree_switch_fold on to avoid re-entry
 static std::set<ea_t> s_ctree_switch_folded;
+
+// Track which functions we've already run ctree_indirect_call on
+static std::set<ea_t> s_ctree_indirect_call_processed;
 
 //--------------------------------------------------------------------------
 // Check if auto mode is enabled
@@ -32,6 +69,7 @@ static bool is_auto_mode_enabled() {
         qstring env_val;
         if (qgetenv("CHERNOBOG_AUTO", &env_val) && !env_val.empty() && env_val[0] == '1') {
             cached = 1;
+            debug_log("[chernobog] AUTO mode detected via env var\n");
         }
         // Also check for ~/.chernobog_auto file as fallback
         if (cached == 0) {
@@ -78,10 +116,13 @@ static void check_verbose_mode() {
 // Hexrays Callback - Add popup menu items and auto-deobfuscate
 //--------------------------------------------------------------------------
 static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va) {
-    // Debug: log all events in auto mode
+    // Debug: log all events
+    debug_log("[chernobog] hexrays_callback event=%d\n", (int)event);
+    
     static bool first_call = true;
-    if (first_call && is_auto_mode_enabled()) {
+    if (first_call) {
         first_call = false;
+        debug_log("[chernobog] First hexrays callback, auto_mode=%d\n", is_auto_mode_enabled() ? 1 : 0);
         msg("[chernobog] Hexrays callback registered and active\n");
     }
 
@@ -112,11 +153,16 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
     // Auto-deobfuscate at microcode stage for analysis
     else if (event == hxe_microcode) {
         mbl_array_t *mba = va_arg(va, mbl_array_t *);
+        debug_log("[chernobog] hxe_microcode: mba=%p, auto=%d\n", mba, is_auto_mode_enabled() ? 1 : 0);
         if (mba && is_auto_mode_enabled()) {
             ea_t func_ea = mba->entry_ea;
-            if (s_auto_deobfuscated.find(func_ea) == s_auto_deobfuscated.end()) {
+            bool already_done = s_auto_deobfuscated.find(func_ea) != s_auto_deobfuscated.end();
+            debug_log("[chernobog] func_ea=0x%llx, already_done=%d\n", (unsigned long long)func_ea, already_done ? 1 : 0);
+            if (!already_done) {
                 s_auto_deobfuscated.insert(func_ea);
+                debug_log("[chernobog] Calling deobfuscate_mba...\n");
                 chernobog_t::deobfuscate_mba(mba);
+                debug_log("[chernobog] deobfuscate_mba returned\n");
             }
         }
     }
@@ -138,6 +184,13 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
                 s_ctree_switch_folded.insert(func_ea);
                 ctree_switch_fold_handler_t::run(cfunc);
             }
+            // Indirect call resolution (Hikari IndirectCall)
+            if (s_ctree_indirect_call_processed.find(func_ea) == s_ctree_indirect_call_processed.end()) {
+                s_ctree_indirect_call_processed.insert(func_ea);
+                if (ctree_indirect_call_handler_t::detect(cfunc)) {
+                    ctree_indirect_call_handler_t::run(cfunc, nullptr);
+                }
+            }
         }
     }
     return 0;
@@ -149,12 +202,17 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
 static bool s_hexrays_initialized = false;
 
 static bool try_init_hexrays() {
+    debug_log("[chernobog] try_init_hexrays called, already_init=%d\n", s_hexrays_initialized ? 1 : 0);
+    
     if (s_hexrays_initialized)
         return true;
 
-    if (!init_hexrays_plugin())
+    if (!init_hexrays_plugin()) {
+        debug_log("[chernobog] init_hexrays_plugin() failed\n");
         return false;
+    }
 
+    debug_log("[chernobog] init_hexrays_plugin() succeeded\n");
     s_hexrays_initialized = true;
 
     // Clear decompiler cache if CHERNOBOG_RESET is set
@@ -174,13 +232,19 @@ static bool try_init_hexrays() {
     // Check auto mode early and print debug info
     bool auto_mode = is_auto_mode_enabled();
     
+    debug_log("[chernobog] Components registered: %d, auto=%d\n",
+        (int)component_registry_t::get_count(), auto_mode ? 1 : 0);
     msg("[chernobog] Chernobog (Hikari Deobfuscator) initializing (%d components registered, auto=%d)\n",
         (int)component_registry_t::get_count(), auto_mode ? 1 : 0);
 
     // Install hexrays callback for popup menus and auto-deobfuscation
+    debug_log("[chernobog] Installing hexrays callback...\n");
     install_hexrays_callback(hexrays_callback, nullptr);
+    debug_log("[chernobog] Hexrays callback installed\n");
 
+    debug_log("[chernobog] Calling init_all()...\n");
     int initialized = component_registry_t::init_all();
+    debug_log("[chernobog] init_all() returned %d components initialized\n", initialized);
     msg("[chernobog] Plugin ready (%d components initialized)\n", initialized);
 
     // Check auto mode at startup
@@ -210,12 +274,16 @@ static ssize_t idaapi idb_callback(void *, int event_id, va_list) {
 // Plugin Initialization
 //--------------------------------------------------------------------------
 static plugmod_t * idaapi init(void) {
+    debug_log("[chernobog] Plugin init() called\n");
+    
     // Try immediate init (works if hexrays loaded first)
     if (try_init_hexrays()) {
+        debug_log("[chernobog] init() returning PLUGIN_KEEP (hexrays ready)\n");
         return PLUGIN_KEEP;
     }
 
     // Hexrays not ready yet - hook IDB events to init later
+    debug_log("[chernobog] Hexrays not ready, hooking IDB events\n");
     msg("[chernobog] Waiting for Hex-Rays decompiler...\n");
     hook_to_notification_point(HT_IDB, idb_callback, nullptr);
 
