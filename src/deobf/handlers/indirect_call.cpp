@@ -116,8 +116,14 @@ int indirect_call_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     if (!mba || !ctx)
         return 0;
 
-    icall_debug("[indirect_call] run() called for func 0x%llx\n",
-                (unsigned long long)mba->entry_ea);
+    icall_debug("[indirect_call] run() called for func 0x%llx, maturity=%d\n",
+                (unsigned long long)mba->entry_ea, mba->maturity);
+
+    // We need MMAT_CALLS (4) or later to have mcallinfo for modifying calls
+    // At earlier maturities, we just resolve and annotate
+    bool can_modify = (mba->maturity >= MMAT_CALLS);
+    icall_debug("[indirect_call] can_modify=%d (maturity %d, need %d)\n",
+                can_modify, mba->maturity, MMAT_CALLS);
 
     int total_changes = 0;
 
@@ -1153,40 +1159,116 @@ int indirect_call_handler_t::replace_indirect_call(mbl_array_t *mba, mblock_t *b
 
     minsn_t *call = ic.call_insn;
 
+    icall_debug("[indirect_call]   Before modification: opcode=%d, l.t=%d, r.t=%d, d.t=%d\n",
+                call->opcode, call->l.t, call->r.t, call->d.t);
+
+    // For m_icall, we want to replace the computed target with the resolved constant
+    // 
+    // Two approaches depending on whether mcallinfo is present:
+    // 1. Unknown call (d.empty()): Keep m_icall, just set l to constant
+    // 2. Known call (d has mcallinfo): Can convert to m_call
+    
+    bool is_unknown = call->d.empty();
+    icall_debug("[indirect_call]   is_unknown_call=%d (d.t=%d)\n", is_unknown, call->d.t);
+    
     if (call->opcode == m_icall) {
-        // Convert m_icall to m_call
-        // Step 1: Clear the l operand (computed target)
-        call->l.erase();
+        // Strategy depends on whether mcallinfo exists:
+        // 
+        // If mcallinfo exists (d.t == mop_f): We can safely convert to m_call
+        // and just update the callee address - arguments are preserved.
+        //
+        // If unknown call (d.empty()): We need to create mcallinfo ourselves,
+        // copying any argument information from the r operand if present.
         
-        // Step 2: Set l to direct function address
-        call->l.t = mop_v;
-        call->l.g = ic.resolved_target;
-        call->l.size = 0;  // Size should be 0 for direct call target
-        
-        // Step 3: Change opcode to m_call
-        call->opcode = m_call;
-        
-        icall_debug("[indirect_call]   Converted m_icall to m_call, target=0x%llx\n", 
-                    (unsigned long long)ic.resolved_target);
+        if (!is_unknown && call->d.t == mop_f && call->d.f != nullptr) {
+            // Has mcallinfo - can do full conversion to m_call
+            icall_debug("[indirect_call]   Converting m_icall to m_call (has mcallinfo)\n");
+            
+            mcallinfo_t *mci = call->d.f;
+            mci->callee = ic.resolved_target;
+            
+            // Try to get function type for better decompilation
+            tinfo_t func_type;
+            if (get_tinfo(&func_type, ic.resolved_target)) {
+                mci->set_type(func_type);
+                icall_debug("[indirect_call]   Set function type from database\n");
+            }
+            
+            // Clear and set l to resolved target
+            call->l.erase();
+            call->l.t = mop_v;
+            call->l.g = ic.resolved_target;
+            call->l.size = NOSIZE;
+            
+            // m_call requires r to be empty
+            call->r.erase();
+            
+            // Convert opcode
+            call->opcode = m_call;
+            
+            icall_debug("[indirect_call]   Converted to m_call with preserved args\n");
+        } else {
+            // Unknown call - create mcallinfo and convert to m_call
+            // We need to create a proper mcallinfo to get clean decompilation
+            icall_debug("[indirect_call]   Converting unknown m_icall to m_call\n");
+            
+            // Create new mcallinfo
+            mcallinfo_t *mci = new mcallinfo_t(ic.resolved_target, 0);
+            mci->cc = CM_CC_FASTCALL;
+            
+            // Try to get function type - this will give us proper args/return
+            tinfo_t func_type;
+            if (get_tinfo(&func_type, ic.resolved_target)) {
+                mci->set_type(func_type);
+                icall_debug("[indirect_call]   Set function type from target\n");
+            } else {
+                // No type info - set void return 
+                mci->return_type.create_simple_type(BT_VOID);
+            }
+            
+            // Set the mcallinfo
+            call->d.erase();
+            call->d.t = mop_f;
+            call->d.f = mci;
+            call->d.size = 0;  // Void return
+            
+            // Clear and set l to resolved target
+            call->l.erase();
+            call->l.t = mop_v;
+            call->l.g = ic.resolved_target;
+            call->l.size = NOSIZE;
+            
+            // m_call requires r to be empty
+            call->r.erase();
+            
+            // Convert opcode
+            call->opcode = m_call;
+            
+            icall_debug("[indirect_call]   Converted to m_call, target=0x%llx\n",
+                        (unsigned long long)ic.resolved_target);
+        }
+                    
     } else if (call->opcode == m_call) {
-        // Already m_call, just fix the target
+        // Already m_call, just update target
+        if (call->d.t == mop_f && call->d.f != nullptr) {
+            call->d.f->callee = ic.resolved_target;
+        }
         call->l.erase();
         call->l.t = mop_v;
         call->l.g = ic.resolved_target;
         call->l.size = 0;
         
-        icall_debug("[indirect_call]   Fixed m_call target to 0x%llx\n",
+        icall_debug("[indirect_call]   Updated m_call target to 0x%llx\n",
                     (unsigned long long)ic.resolved_target);
     }
 
     // Verify the instruction looks correct
-    icall_debug("[indirect_call]   After: opcode=%d, l.t=%d, l.g=0x%llx, d.t=%d\n",
-                call->opcode, call->l.t, (unsigned long long)call->l.g, call->d.t);
+    icall_debug("[indirect_call]   After: opcode=%d, l.t=%d, l.g=0x%llx, l.size=%d, r.t=%d, d.t=%d\n",
+                call->opcode, call->l.t, (unsigned long long)call->l.g, call->l.size,
+                call->r.t, call->d.t);
 
     // Mark the block as modified
     blk->mark_lists_dirty();
-    
-    // Request full re-analysis
     blk->mba->mark_chains_dirty();
 
     // Add comment to the original address
