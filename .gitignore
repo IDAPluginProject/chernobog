@@ -83,3 +83,11 @@ Desktop.ini
 *.temp
 *.bak
 *.orig
+
+# Temporary test files
+foo
+foo.c
+
+# Test binaries
+tests/string_obfuscation/test_strings
+*.dSYM/
