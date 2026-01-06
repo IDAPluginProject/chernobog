@@ -9,6 +9,7 @@
 #include "../deobf/handlers/ctree_const_fold.h"
 #include "../deobf/handlers/ctree_switch_fold.h"
 #include "../deobf/handlers/ctree_indirect_call.h"
+#include "../deobf/handlers/ctree_string_decrypt.h"
 
 #include <set>
 #include <cstdio>
@@ -56,6 +57,9 @@ static std::set<ea_t> s_ctree_switch_folded;
 
 // Track which functions we've already run ctree_indirect_call on
 static std::set<ea_t> s_ctree_indirect_call_processed;
+
+// Track which functions we've already run ctree_string_decrypt on
+static std::set<ea_t> s_ctree_string_decrypt_processed;
 
 //--------------------------------------------------------------------------
 // Check if auto mode is enabled
@@ -147,6 +151,7 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
             s_auto_deobfuscated.erase(func_ea);
             s_ctree_const_folded.erase(func_ea);
             s_ctree_switch_folded.erase(func_ea);
+            s_ctree_string_decrypt_processed.erase(func_ea);
             chernobog_clear_function_tracking(func_ea);
         }
     }
@@ -189,6 +194,19 @@ static ssize_t idaapi hexrays_callback(void *, hexrays_event_t event, va_list va
                 s_ctree_indirect_call_processed.insert(func_ea);
                 if (ctree_indirect_call_handler_t::detect(cfunc)) {
                     ctree_indirect_call_handler_t::run(cfunc, nullptr);
+                }
+            }
+            // String decryption (strcpy reveals, char-by-char, AES keys)
+            if (s_ctree_string_decrypt_processed.find(func_ea) == s_ctree_string_decrypt_processed.end()) {
+                s_ctree_string_decrypt_processed.insert(func_ea);
+                if (ctree_string_decrypt_handler_t::detect(cfunc)) {
+                    deobf_ctx_t str_ctx;
+                    str_ctx.cfunc = cfunc;
+                    str_ctx.func_ea = func_ea;
+                    int changes = ctree_string_decrypt_handler_t::run(cfunc, &str_ctx);
+                    if (changes > 0) {
+                        msg("[chernobog] Ctree string decryption: found %d strings\n", changes);
+                    }
                 }
             }
         }
