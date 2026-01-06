@@ -1055,6 +1055,14 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
     }
     
     int idaapi visit_expr(cexpr_t *e) override {
+        // Debug: log all cot_obj and cot_ref nodes to understand what we're seeing
+        if (e->op == cot_ref && e->x && e->x->op == cot_obj) {
+            qstring name;
+            get_name(&name, e->x->obj_ea);
+            ctree_str_debug("[visit] cot_ref -> cot_obj at 0x%llx (%s)\n",
+                           (unsigned long long)e->x->obj_ea, name.c_str());
+        }
+        
         // Log all calls to understand what patterns exist
         if (e->op == cot_call && e->x) {
             const char *call_name = "unknown";
@@ -1134,6 +1142,14 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
                     }
                 }
             }
+        }
+        // CFSTR() shows up as cot_ref -> cot_obj (taking address of CFString structure)
+        // This is the main pattern for CFSTR() in pseudocode
+        else if (e->op == cot_ref && e->x && e->x->op == cot_obj) {
+            str_addr = e->x->obj_ea;
+            target_expr = e;  // The whole cot_ref expression
+            ctree_str_debug("[replace] Found cot_ref->cot_obj (CFSTR pattern) at 0x%llx\n",
+                           (unsigned long long)str_addr);
         }
         // Direct cot_obj reference
         else if (e->op == cot_obj) {
