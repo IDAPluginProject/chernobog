@@ -701,7 +701,9 @@ void deobf_done() {
     // Clear AST caches (the RuleRegistry singleton intentionally leaks
     // on exit to avoid crashes during static destruction)
     chernobog::ast::clear_ast_caches();
-    chernobog::rules::RuleRegistry::instance().clear();
+    // NOTE: Do NOT call RuleRegistry::instance().clear() here!
+    // The RuleRegistry singleton intentionally leaks to avoid crashes from
+    // mop_t destructors calling IDA functions that are unavailable at shutdown.
 
     deobf::log("[chernobog] Deobfuscator terminated\n");
 }
