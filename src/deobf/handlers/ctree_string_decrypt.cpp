@@ -861,7 +861,480 @@ int ctree_string_decrypt_handler_t::run(cfunc_t *cfunc, deobf_ctx_t *ctx) {
     ctree_str_debug("[ctree_string] Found %zu strcpy/memcpy reveals, %zu crypto calls, %zu char strings\n",
                    call_visitor.reveals.size(), call_visitor.crypto_calls.size(), char_strings.size());
     
+    // Phase 2: Find encrypted strings in ctree and replace with decrypted values
+    // Build a map of destination addresses -> plaintexts from reveals
+    std::map<ea_t, qstring> addr_to_plaintext;
+    for (const auto &reveal : call_visitor.reveals) {
+        if (reveal.dest_addr != BADADDR && !reveal.plaintext.empty()) {
+            addr_to_plaintext[reveal.dest_addr] = reveal.plaintext;
+        }
+    }
+    
+    if (!addr_to_plaintext.empty()) {
+        int replaced = replace_encrypted_strings(cfunc, addr_to_plaintext);
+        if (replaced > 0) {
+            ctree_str_debug("[ctree_string] Replaced %d encrypted strings in ctree\n", replaced);
+            total_changes += replaced;
+        }
+    }
+    
     return total_changes;
+}
+
+//--------------------------------------------------------------------------
+// Encrypted string replacement visitor
+//--------------------------------------------------------------------------
+struct encrypted_string_replacer_t : public ctree_visitor_t {
+    cfunc_t *cfunc;
+    const std::map<ea_t, qstring> &known_plaintexts;
+    int replacements = 0;
+    
+    encrypted_string_replacer_t(cfunc_t *cf, const std::map<ea_t, qstring> &plaintexts)
+        : ctree_visitor_t(CV_FAST), cfunc(cf), known_plaintexts(plaintexts) {}
+    
+    // Check if data at address looks encrypted (has non-printable chars)
+    static bool is_encrypted_string(ea_t addr, size_t max_len = 256) {
+        if (addr == BADADDR || !is_loaded(addr))
+            return false;
+            
+        int non_printable = 0;
+        int total = 0;
+        
+        for (size_t i = 0; i < max_len; i++) {
+            uint8_t c = get_byte(addr + i);
+            if (c == 0) break;
+            total++;
+            if (c < 0x20 || c > 0x7E) {
+                if (c != '\n' && c != '\r' && c != '\t') {
+                    non_printable++;
+                }
+            }
+        }
+        
+        // Consider encrypted if >30% non-printable and at least 4 chars
+        return total >= 4 && non_printable > 0 && (non_printable * 100 / total) > 30;
+    }
+    
+    // Try to decrypt using XOR with known plaintext
+    static bool try_xor_decrypt(ea_t encrypted_addr, const qstring &known_plain, qstring *out) {
+        if (encrypted_addr == BADADDR || known_plain.empty())
+            return false;
+            
+        size_t len = known_plain.length();
+        
+        // Read encrypted data
+        std::vector<uint8_t> encrypted(len);
+        if (get_bytes(encrypted.data(), len, encrypted_addr) != len)
+            return false;
+        
+        // Compute XOR key by XORing encrypted with known plaintext
+        std::vector<uint8_t> key(len);
+        for (size_t i = 0; i < len; i++) {
+            key[i] = encrypted[i] ^ (uint8_t)known_plain[i];
+        }
+        
+        // Verify by decrypting - should get plaintext back
+        qstring decrypted;
+        for (size_t i = 0; i < len; i++) {
+            char c = encrypted[i] ^ key[i];
+            if (c == 0) break;
+            decrypted += c;
+        }
+        
+        if (decrypted == known_plain) {
+            *out = decrypted;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Helper to get op name for debugging
+    static const char* get_op_name(ctype_t op) {
+        switch(op) {
+            case cot_comma: return "cot_comma";
+            case cot_asg: return "cot_asg";
+            case cot_asgbor: return "cot_asgbor";
+            case cot_asgxor: return "cot_asgxor";
+            case cot_asgband: return "cot_asgband";
+            case cot_asgadd: return "cot_asgadd";
+            case cot_asgsub: return "cot_asgsub";
+            case cot_asgmul: return "cot_asgmul";
+            case cot_asgsshr: return "cot_asgsshr";
+            case cot_asgushr: return "cot_asgushr";
+            case cot_asgshl: return "cot_asgshl";
+            case cot_asgsdiv: return "cot_asgsdiv";
+            case cot_asgudiv: return "cot_asgudiv";
+            case cot_asgsmod: return "cot_asgsmod";
+            case cot_asgumod: return "cot_asgumod";
+            case cot_tern: return "cot_tern";
+            case cot_lor: return "cot_lor";
+            case cot_land: return "cot_land";
+            case cot_bor: return "cot_bor";
+            case cot_xor: return "cot_xor";
+            case cot_band: return "cot_band";
+            case cot_eq: return "cot_eq";
+            case cot_ne: return "cot_ne";
+            case cot_sge: return "cot_sge";
+            case cot_uge: return "cot_uge";
+            case cot_sle: return "cot_sle";
+            case cot_ule: return "cot_ule";
+            case cot_sgt: return "cot_sgt";
+            case cot_ugt: return "cot_ugt";
+            case cot_slt: return "cot_slt";
+            case cot_ult: return "cot_ult";
+            case cot_sshr: return "cot_sshr";
+            case cot_ushr: return "cot_ushr";
+            case cot_shl: return "cot_shl";
+            case cot_add: return "cot_add";
+            case cot_sub: return "cot_sub";
+            case cot_mul: return "cot_mul";
+            case cot_sdiv: return "cot_sdiv";
+            case cot_udiv: return "cot_udiv";
+            case cot_smod: return "cot_smod";
+            case cot_umod: return "cot_umod";
+            case cot_fadd: return "cot_fadd";
+            case cot_fsub: return "cot_fsub";
+            case cot_fmul: return "cot_fmul";
+            case cot_fdiv: return "cot_fdiv";
+            case cot_fneg: return "cot_fneg";
+            case cot_neg: return "cot_neg";
+            case cot_cast: return "cot_cast";
+            case cot_lnot: return "cot_lnot";
+            case cot_bnot: return "cot_bnot";
+            case cot_ptr: return "cot_ptr";
+            case cot_ref: return "cot_ref";
+            case cot_postinc: return "cot_postinc";
+            case cot_postdec: return "cot_postdec";
+            case cot_preinc: return "cot_preinc";
+            case cot_predec: return "cot_predec";
+            case cot_call: return "cot_call";
+            case cot_idx: return "cot_idx";
+            case cot_memref: return "cot_memref";
+            case cot_memptr: return "cot_memptr";
+            case cot_num: return "cot_num";
+            case cot_fnum: return "cot_fnum";
+            case cot_str: return "cot_str";
+            case cot_obj: return "cot_obj";
+            case cot_var: return "cot_var";
+            case cot_insn: return "cot_insn";
+            case cot_sizeof: return "cot_sizeof";
+            case cot_helper: return "cot_helper";
+            case cot_type: return "cot_type";
+            default: return "unknown";
+        }
+    }
+    
+    int idaapi visit_expr(cexpr_t *e) override {
+        // Log all calls to understand what patterns exist
+        if (e->op == cot_call && e->x) {
+            const char *call_name = "unknown";
+            if (e->x->op == cot_helper) {
+                call_name = e->x->helper;
+            } else if (e->x->op == cot_obj) {
+                static char name_buf[256];
+                qstring name;
+                if (get_name(&name, e->x->obj_ea) > 0) {
+                    qstrncpy(name_buf, name.c_str(), sizeof(name_buf));
+                    call_name = name_buf;
+                }
+            }
+            
+            // Log call details with args
+            if (e->a && e->a->size() > 0) {
+                qstring args_info;
+                for (size_t i = 0; i < e->a->size() && i < 3; i++) {
+                    cexpr_t *arg = &(*e->a)[i];
+                    args_info.cat_sprnt(" arg%zu:%s", i, get_op_name(arg->op));
+                    if (arg->op == cot_str && arg->string) {
+                        size_t len = strlen(arg->string);
+                        qstring hex;
+                        for (size_t j = 0; j < len && j < 8; j++) {
+                            hex.cat_sprnt("%02X", (uint8_t)arg->string[j]);
+                        }
+                        args_info.cat_sprnt("(hex=%s)", hex.c_str());
+                    } else if (arg->op == cot_obj) {
+                        args_info.cat_sprnt("(0x%llx)", (unsigned long long)arg->obj_ea);
+                    }
+                }
+                ctree_str_debug("[call] %s%s\n", call_name, args_info.c_str());
+            }
+        }
+        
+        // Look for CFSTR or string references that might be encrypted
+        // CFSTR appears as: call to CFSTR helper with cot_obj argument
+        // Or direct cot_obj/cot_str
+        
+        ea_t str_addr = BADADDR;
+        const char *existing_str = nullptr;
+        cexpr_t *target_expr = e;  // Expression to modify
+        
+        // Check for CFSTR(x) call pattern - this is how IDA shows CFString references
+        if (e->op == cot_call && e->x) {
+            // Check both helper and regular call
+            const char *func_name = nullptr;
+            if (e->x->op == cot_helper) {
+                func_name = e->x->helper;
+                ctree_str_debug("[replace] Call to helper: %s\n", func_name);
+            } else if (e->x->op == cot_obj) {
+                qstring name;
+                if (get_name(&name, e->x->obj_ea) > 0) {
+                    static char name_buf[256];
+                    qstrncpy(name_buf, name.c_str(), sizeof(name_buf));
+                    func_name = name_buf;
+                }
+            }
+            
+            if (func_name && (strstr(func_name, "CFSTR") || strstr(func_name, "CFString") ||
+                              strstr(func_name, "__CFString"))) {
+                ctree_str_debug("[replace] Found CFSTR-like call: %s\n", func_name);
+                // The argument to CFSTR is what we want to decrypt
+                if (e->a && e->a->size() > 0) {
+                    cexpr_t *arg = &(*e->a)[0];
+                    ctree_str_debug("[replace] CFSTR arg op: %s\n", get_op_name(arg->op));
+                    if (arg->op == cot_obj) {
+                        str_addr = arg->obj_ea;
+                        target_expr = arg;  // We'll modify the argument
+                        ctree_str_debug("[replace] Found CFSTR() call, arg at 0x%llx\n",
+                                       (unsigned long long)str_addr);
+                    } else if (arg->op == cot_str && arg->string) {
+                        existing_str = arg->string;
+                        target_expr = arg;
+                        ctree_str_debug("[replace] Found CFSTR() with string arg: \"%s\"\n",
+                                       existing_str);
+                    }
+                }
+            }
+        }
+        // Direct cot_obj reference
+        else if (e->op == cot_obj) {
+            str_addr = e->obj_ea;
+        }
+        // Direct cot_str 
+        else if (e->op == cot_str && e->string) {
+            existing_str = e->string;
+            // Log raw bytes for debugging
+            size_t slen = strlen(existing_str);
+            qstring hex_dump;
+            for (size_t i = 0; i < slen && i < 32; i++) {
+                hex_dump.cat_sprnt("%02X ", (uint8_t)existing_str[i]);
+            }
+            ctree_str_debug("[replace] Found cot_str: len=%zu hex=[%s]\n", 
+                           slen, hex_dump.c_str());
+        } else {
+            return 0;
+        }
+        
+        if (str_addr == BADADDR && !existing_str)
+            return 0;
+        
+        // Try to find matching plaintext
+        qstring decrypted;
+        bool found = false;
+        
+        // Case 1: We have an existing string (cot_str) - check if it's encrypted
+        if (existing_str) {
+            size_t enc_len = strlen(existing_str);
+            
+            // Check if it looks encrypted
+            int non_printable = 0;
+            for (size_t i = 0; i < enc_len; i++) {
+                uint8_t c = (uint8_t)existing_str[i];
+                if (c < 0x20 || c > 0x7E) {
+                    if (c != '\n' && c != '\r' && c != '\t') {
+                        non_printable++;
+                    }
+                }
+            }
+            
+            // Skip if not encrypted (< 30% non-printable)
+            if (enc_len < 4 || non_printable == 0 || (non_printable * 100 / enc_len) <= 30)
+                return 0;
+            
+            // Try each known plaintext with XOR
+            for (const auto &kv : known_plaintexts) {
+                const qstring &plain = kv.second;
+                
+                // Length must match approximately
+                if (plain.length() != enc_len && 
+                    plain.length() != enc_len - 1 && 
+                    plain.length() != enc_len + 1)
+                    continue;
+                
+                // Try XOR decryption using the string bytes directly
+                size_t min_len = std::min(enc_len, plain.length());
+                qstring test_decrypt;
+                bool valid = true;
+                
+                for (size_t i = 0; i < min_len; i++) {
+                    uint8_t enc_byte = (uint8_t)existing_str[i];
+                    uint8_t plain_byte = (uint8_t)plain[i];
+                    uint8_t key_byte = enc_byte ^ plain_byte;
+                    char dec_char = enc_byte ^ key_byte;
+                    
+                    if (dec_char == 0) break;
+                    test_decrypt += dec_char;
+                }
+                
+                // Check if decryption matches the known plaintext
+                if (test_decrypt == plain) {
+                    decrypted = plain;
+                    found = true;
+                    ctree_str_debug("[replace] Matched cot_str to known plaintext: \"%s\"\n", 
+                                   decrypted.c_str());
+                    break;
+                }
+            }
+        }
+        // Case 2: We have an address (cot_obj) - read from memory
+        else if (str_addr != BADADDR) {
+            // Check if this is a CFSTR - typically in __cfstring section
+            segment_t *seg = getseg(str_addr);
+            if (!seg)
+                return 0;
+                
+            qstring seg_name;
+            get_segm_name(&seg_name, seg);
+            
+            ea_t actual_str_addr = str_addr;
+            
+            ctree_str_debug("[replace] cot_obj at 0x%llx in segment %s\n", 
+                           (unsigned long long)str_addr, seg_name.c_str());
+            
+            // Check if this looks like a CFString structure by checking the name or segment
+            qstring name_at_addr;
+            get_name(&name_at_addr, str_addr);
+            bool is_cfstring_struct = seg_name.find("cfstring") != qstring::npos ||
+                                       name_at_addr.find("cfstr_") != qstring::npos ||
+                                       name_at_addr.find("CFString") != qstring::npos;
+            
+            ctree_str_debug("[replace] Name at 0x%llx = '%s', is_cfstring=%d\n",
+                           (unsigned long long)str_addr, name_at_addr.c_str(), is_cfstring_struct);
+            
+            // IMPORTANT: Only replace CFSTR references, not destination buffers
+            // A CFSTR reference has a structure pointer that points to the string data
+            // A destination buffer is just the raw data location (what strcpy writes to)
+            // We skip non-CFSTR structures to avoid breaking strcpy/memcpy calls
+            if (!is_cfstring_struct) {
+                ctree_str_debug("[replace] Skipping non-CFSTR cot_obj at 0x%llx\n",
+                               (unsigned long long)str_addr);
+                return 0;
+            }
+            
+            // Handle CFSTR structure - the actual string is at offset 0x10
+            // CFString layout: isa(8), flags(8), str_ptr(8), length(8)
+            ea_t ptr = get_qword(str_addr + 0x10);
+            ctree_str_debug("[replace] Checking as CFSTR structure: ptr at +0x10 = 0x%llx\n",
+                           (unsigned long long)ptr);
+            if (ptr != 0 && ptr != BADADDR && is_loaded(ptr)) {
+                // Validate: the length field should be reasonable
+                uint64_t len = get_qword(str_addr + 0x18);
+                if (len > 0 && len < 4096) {
+                    actual_str_addr = ptr;
+                    ctree_str_debug("[replace] Using CFSTR string ptr 0x%llx, len=%llu\n",
+                                   (unsigned long long)ptr, (unsigned long long)len);
+                }
+            }
+            
+            // Check if string at this address is encrypted
+            if (!is_encrypted_string(actual_str_addr)) {
+                ctree_str_debug("[replace] String at 0x%llx not encrypted, skipping\n",
+                               (unsigned long long)actual_str_addr);
+                return 0;
+            }
+                
+            ctree_str_debug("[replace] Found encrypted cot_obj at 0x%llx\n", 
+                           (unsigned long long)actual_str_addr);
+            
+            // Get encrypted string length
+            size_t enc_len = 0;
+            for (size_t i = 0; i < 256; i++) {
+                if (get_byte(actual_str_addr + i) == 0) break;
+                enc_len++;
+            }
+            
+            ctree_str_debug("[replace] Encrypted string at 0x%llx has len=%zu, have %zu known plaintexts\n",
+                           (unsigned long long)actual_str_addr, enc_len, known_plaintexts.size());
+            
+            // First check: is there a direct match by address?
+            auto it = known_plaintexts.find(actual_str_addr);
+            if (it != known_plaintexts.end()) {
+                decrypted = it->second;
+                found = true;
+                ctree_str_debug("[replace] Direct address match! Using plaintext: \"%s\"\n", decrypted.c_str());
+            }
+            
+            // Try each known plaintext
+            if (!found) {
+                for (const auto &kv : known_plaintexts) {
+                    const qstring &plain = kv.second;
+                    
+                    ctree_str_debug("[replace] Trying plaintext len=%zu vs enc_len=%zu\n", 
+                                   plain.length(), enc_len);
+                    
+                    if (plain.length() != enc_len && 
+                        plain.length() != enc_len - 1 && 
+                        plain.length() != enc_len + 1)
+                        continue;
+                    
+                    if (try_xor_decrypt(actual_str_addr, plain, &decrypted)) {
+                        found = true;
+                        ctree_str_debug("[replace] Decrypted cot_obj to: \"%s\"\n", decrypted.c_str());
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (!found)
+            return 0;
+            
+        // Add comment at the expression's address  
+        if (target_expr->ea != BADADDR) {
+            qstring comment;
+            comment.sprnt("DEOBF: Decrypted CFSTR = \"%s\"", decrypted.c_str());
+            set_cmt(target_expr->ea, comment.c_str(), false);
+        }
+        
+        // Try to patch the CFString's string data in the IDB
+        // This will make CFSTR() show the decrypted string on re-decompilation
+        // Note: We need to track the actual string data address separately
+        if (str_addr != BADADDR) {
+            // Check if this is a CFString struct and get the string pointer
+            qstring name_at;
+            get_name(&name_at, str_addr);
+            if (name_at.find("cfstr_") != qstring::npos || name_at.find("CFString") != qstring::npos) {
+                ea_t string_data_ptr = get_qword(str_addr + 0x10);
+                if (string_data_ptr != 0 && string_data_ptr != BADADDR && is_loaded(string_data_ptr)) {
+                    // Patch the string data bytes  
+                    size_t dec_len = decrypted.length();
+                    for (size_t i = 0; i < dec_len; i++) {
+                        patch_byte(string_data_ptr + i, (uint8_t)decrypted[i]);
+                    }
+                    // Null terminate
+                    patch_byte(string_data_ptr + dec_len, 0);
+                    
+                    ctree_str_debug("[replace] Patched %zu bytes at 0x%llx with decrypted string\n",
+                                   dec_len, (unsigned long long)string_data_ptr);
+                }
+            }
+        }
+        
+        ctree_str_debug("[replace] Added comment at 0x%llx for \"%s\"\n",
+                       (unsigned long long)target_expr->ea, decrypted.c_str());
+        
+        replacements++;
+        return 0;
+    }
+};
+
+int ctree_string_decrypt_handler_t::replace_encrypted_strings(
+    cfunc_t *cfunc, 
+    const std::map<ea_t, qstring> &known_plaintexts)
+{
+    encrypted_string_replacer_t replacer(cfunc, known_plaintexts);
+    replacer.apply_to(&cfunc->body, nullptr);
+    return replacer.replacements;
 }
 
 //--------------------------------------------------------------------------

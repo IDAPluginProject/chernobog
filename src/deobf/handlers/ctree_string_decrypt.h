@@ -137,6 +137,10 @@ private:
     static int patch_ctree_reference(cfunc_t *cfunc, ea_t encrypted_addr, 
                                      const qstring &decrypted);
     
+    // Replace all encrypted strings in ctree using known plaintexts
+    static int replace_encrypted_strings(cfunc_t *cfunc,
+                                        const std::map<ea_t, qstring> &known_plaintexts);
+    
     //----------------------------------------------------------------------
     // Helper functions
     //----------------------------------------------------------------------
