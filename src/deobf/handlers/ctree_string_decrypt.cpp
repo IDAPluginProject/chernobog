@@ -1193,10 +1193,11 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
             }
             
             // Skip if not encrypted (< 30% non-printable)
-            if (enc_len < 4 || non_printable == 0 || (non_printable * 100 / enc_len) <= 30)
+            // Allow short strings (2+ chars) since "OK", "Yes", etc. are common
+            if (enc_len < 2 || non_printable == 0 || (non_printable * 100 / enc_len) <= 30)
                 return 0;
             
-            // Try each known plaintext with XOR
+            // Try each known plaintext with XOR (same-length match)
             for (const auto &kv : known_plaintexts) {
                 const qstring &plain = kv.second;
                 
@@ -1228,6 +1229,52 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
                     ctree_str_debug("[replace] Matched cot_str to known plaintext: \"%s\"\n", 
                                    decrypted.c_str());
                     break;
+                }
+            }
+            
+            // Fallback: Try to derive XOR key from any known pair and apply to this string
+            // Hikari often uses the same key for all strings in a function
+            if (!found && enc_len >= 2 && enc_len <= 8) {
+                // Find a known encrypted/plaintext pair to derive the key
+                for (const auto &kv : known_plaintexts) {
+                    ea_t known_addr = kv.first;
+                    const qstring &known_plain = kv.second;
+                    
+                    if (known_plain.length() < enc_len)
+                        continue;
+                    
+                    // Read encrypted bytes at known_addr
+                    std::vector<uint8_t> known_enc(enc_len);
+                    if (get_bytes(known_enc.data(), enc_len, known_addr) != enc_len)
+                        continue;
+                    
+                    // Derive XOR key from this pair
+                    std::vector<uint8_t> key(enc_len);
+                    for (size_t i = 0; i < enc_len; i++) {
+                        key[i] = known_enc[i] ^ (uint8_t)known_plain[i];
+                    }
+                    
+                    // Apply key to our encrypted string
+                    qstring candidate;
+                    bool all_printable = true;
+                    for (size_t i = 0; i < enc_len; i++) {
+                        char c = (uint8_t)existing_str[i] ^ key[i];
+                        if (c == 0) break;
+                        if (c < 0x20 || c > 0x7E) {
+                            all_printable = false;
+                            break;
+                        }
+                        candidate += c;
+                    }
+                    
+                    // Accept if result is printable and reasonable
+                    if (all_printable && candidate.length() >= 2) {
+                        decrypted = candidate;
+                        found = true;
+                        ctree_str_debug("[replace] Derived XOR key from 0x%llx, decrypted to: \"%s\"\n",
+                                       (unsigned long long)known_addr, decrypted.c_str());
+                        break;
+                    }
                 }
             }
         }
@@ -1292,15 +1339,36 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
             // Handle CFSTR structure - the actual string is at offset 0x10
             // CFString layout: isa(8), flags(8), str_ptr(8), length(8)
             ea_t ptr = get_qword(str_addr + 0x10);
-            ctree_str_debug("[replace] Checking as CFSTR structure: ptr at +0x10 = 0x%llx\n",
-                           (unsigned long long)ptr);
+            uint64_t len_field = get_qword(str_addr + 0x18);
+            ctree_str_debug("[replace] Checking as CFSTR structure: ptr at +0x10 = 0x%llx, len at +0x18 = %llu, is_loaded=%d\n",
+                           (unsigned long long)ptr, (unsigned long long)len_field, is_loaded(ptr));
             if (ptr != 0 && ptr != BADADDR && is_loaded(ptr)) {
-                // Validate: the length field should be reasonable
+                // Get length field - but don't require it to be valid
+                // Some obfuscators corrupt the length field
                 uint64_t len = get_qword(str_addr + 0x18);
                 if (len > 0 && len < 4096) {
                     actual_str_addr = ptr;
                     ctree_str_debug("[replace] Using CFSTR string ptr 0x%llx, len=%llu\n",
                                    (unsigned long long)ptr, (unsigned long long)len);
+                } else {
+                    // Length field invalid, but pointer looks valid - use it anyway
+                    // Compute actual length by scanning for null terminator
+                    ctree_str_debug("[replace] Length field invalid (len=%llu), computing actual length\n",
+                                   (unsigned long long)len);
+                    size_t actual_len = 0;
+                    for (size_t i = 0; i < 256; i++) {
+                        uint8_t b = get_byte(ptr + i);
+                        if (b == 0) {
+                            actual_len = i;
+                            break;
+                        }
+                    }
+                    ctree_str_debug("[replace] Computed actual_len=%zu\n", actual_len);
+                    if (actual_len > 0) {
+                        actual_str_addr = ptr;
+                        ctree_str_debug("[replace] Using CFSTR string ptr 0x%llx (computed len=%zu)\n",
+                                       (unsigned long long)ptr, actual_len);
+                    }
                 }
             }
             
