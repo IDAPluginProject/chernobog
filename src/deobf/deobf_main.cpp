@@ -19,6 +19,7 @@
 #include "handlers/global_const.h"
 #include "handlers/ptr_resolve.h"
 #include "handlers/indirect_call.h"
+#include "handlers/ctree_string_decrypt.h"
 #include "analysis/ast_builder.h"
 #include "rules/rule_registry.h"
 
@@ -158,10 +159,29 @@ int idaapi chernobog_optblock_t::func(mblock_t *blk) {
     // with state constants), but the CFG has explicit gotos that can be modified.
 
     // Process at multiple maturity levels
-    // MMAT_LOCOPT (3): CFG modifications
+    // MMAT_LOCOPT (3): CFG modifications (but calls are "unknown" - no mcallinfo)
+    // MMAT_CALLS (4): Call info is available - can modify indirect calls
     // MMAT_GLBOPT1 (5): Global constant inlining (addresses resolved)
-    if (maturity != MMAT_LOCOPT && maturity != MMAT_GLBOPT1)
+    if (maturity != MMAT_LOCOPT && maturity != MMAT_CALLS && maturity != MMAT_GLBOPT1)
         return 0;
+    
+    // At MMAT_CALLS, specifically try to resolve indirect calls
+    // This is when mcallinfo is available, making it safe to modify calls
+    if (maturity == MMAT_CALLS) {
+        if (indirect_call_handler_t::detect(mba)) {
+            optblock_debug("[optblock] Running indirect call handler at MMAT_CALLS\n");
+            msg("[optblock] Running indirect call deobfuscation at maturity %d (MMAT_CALLS)\n", maturity);
+            deobf_ctx_t icall_ctx;
+            icall_ctx.mba = mba;
+            icall_ctx.func_ea = func_ea;
+            int changes = indirect_call_handler_t::run(mba, &icall_ctx);
+            if (changes > 0) {
+                msg("[optblock] Resolved %d indirect calls at MMAT_CALLS\n", icall_ctx.indirect_resolved);
+                return 1;  // Signal that we made changes
+            }
+        }
+        return 0;
+    }
 
     deobf_ctx_t ctx;
     ctx.mba = mba;
@@ -423,6 +443,15 @@ static void run_deobfuscation_passes(mbl_array_t *mba, deobf_ctx_t *ctx) {
     // 7. Deflatten control flow (most complex, do last)
     if (ctx->detected_obf & OBF_FLATTENED) {
         total_changes += chernobog_t::deflatten(mba, ctx);
+    }
+
+    // 8. Ctree-level string analysis (runs on cfunc if available)
+    if (ctx->cfunc) {
+        int str_changes = ctree_string_decrypt_handler_t::run(ctx->cfunc, ctx);
+        if (str_changes > 0) {
+            total_changes += str_changes;
+            deobf::log("[chernobog] Ctree string analysis: %d strings found\n", str_changes);
+        }
     }
 
     deobf::log("[chernobog] Deobfuscation complete. Total changes: %d\n", total_changes);

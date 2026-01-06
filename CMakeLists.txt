@@ -127,6 +127,7 @@ ida_add_plugin(chernobog
     src/deobf/handlers/ctree_const_fold.cpp
     src/deobf/handlers/ctree_switch_fold.cpp
     src/deobf/handlers/ctree_indirect_call.cpp
+    src/deobf/handlers/ctree_string_decrypt.cpp
 )
 
 # Link Z3 library
