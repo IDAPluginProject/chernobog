@@ -862,13 +862,42 @@ int ctree_string_decrypt_handler_t::run(cfunc_t *cfunc, deobf_ctx_t *ctx) {
                    call_visitor.reveals.size(), call_visitor.crypto_calls.size(), char_strings.size());
     
     // Phase 2: Find encrypted strings in ctree and replace with decrypted values
-    // Build a map of destination addresses -> plaintexts from reveals
+    // Build a map of destination addresses -> plaintexts from ALL sources
     std::map<ea_t, qstring> addr_to_plaintext;
+    
+    // Add strcpy/memcpy reveals
     for (const auto &reveal : call_visitor.reveals) {
         if (reveal.dest_addr != BADADDR && !reveal.plaintext.empty()) {
             addr_to_plaintext[reveal.dest_addr] = reveal.plaintext;
+            ctree_str_debug("[mapping] strcpy/memcpy: 0x%llx -> \"%s\"\n",
+                           (unsigned long long)reveal.dest_addr, reveal.plaintext.c_str());
         }
     }
+    
+    // Add character-by-character reconstructed strings
+    for (const auto &str : char_strings) {
+        if (str.var_addr != BADADDR && !str.reconstructed.empty()) {
+            addr_to_plaintext[str.var_addr] = str.reconstructed;
+            ctree_str_debug("[mapping] char-by-char: 0x%llx -> \"%s\"\n",
+                           (unsigned long long)str.var_addr, str.reconstructed.c_str());
+        }
+    }
+    
+    // Add crypto call results
+    for (const auto &crypto : call_visitor.crypto_calls) {
+        if (!crypto.decrypted.empty()) {
+            if (crypto.input_addr != BADADDR) {
+                addr_to_plaintext[crypto.input_addr] = crypto.decrypted;
+                ctree_str_debug("[mapping] crypto input: 0x%llx -> \"%s\"\n",
+                               (unsigned long long)crypto.input_addr, crypto.decrypted.c_str());
+            }
+            if (crypto.output_addr != BADADDR) {
+                addr_to_plaintext[crypto.output_addr] = crypto.decrypted;
+            }
+        }
+    }
+    
+    ctree_str_debug("[ctree_string] Built address->plaintext map with %zu entries\n", addr_to_plaintext.size());
     
     if (!addr_to_plaintext.empty()) {
         int replaced = replace_encrypted_strings(cfunc, addr_to_plaintext);
@@ -1201,12 +1230,35 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
             ctree_str_debug("[replace] cot_obj at 0x%llx in segment %s\n", 
                            (unsigned long long)str_addr, seg_name.c_str());
             
-            // Check if this looks like a CFString structure by checking the name or segment
+            // Check if this looks like a CFString structure by checking name, segment, or layout
             qstring name_at_addr;
             get_name(&name_at_addr, str_addr);
             bool is_cfstring_struct = seg_name.find("cfstring") != qstring::npos ||
                                        name_at_addr.find("cfstr_") != qstring::npos ||
-                                       name_at_addr.find("CFString") != qstring::npos;
+                                       name_at_addr.find("CFString") != qstring::npos ||
+                                       name_at_addr.find("stru_") != qstring::npos;  // May be unnamed CFString
+            
+            // If it looks like a struct, verify it's actually a CFString by checking the layout
+            // CFString layout: isa(8), flags(8), str_ptr(8), length(8)
+            if (!is_cfstring_struct && seg_name == "__data") {
+                // Check if this could be a CFString by validating the structure
+                uint64_t maybe_flags = get_qword(str_addr + 0x08);
+                ea_t maybe_ptr = get_qword(str_addr + 0x10);
+                uint64_t maybe_len = get_qword(str_addr + 0x18);
+                
+                // Heuristic: flags should be non-zero but reasonable, ptr should be valid, len should be small
+                if (maybe_flags != 0 && maybe_flags < 0x10000 &&
+                    maybe_ptr != 0 && maybe_ptr != BADADDR && is_loaded(maybe_ptr) &&
+                    maybe_len > 0 && maybe_len < 4096) {
+                    // Check if the pointer points to a known plaintext address
+                    auto it = known_plaintexts.find(maybe_ptr);
+                    if (it != known_plaintexts.end()) {
+                        is_cfstring_struct = true;
+                        ctree_str_debug("[replace] Detected CFString structure by layout at 0x%llx (ptr=0x%llx)\n",
+                                       (unsigned long long)str_addr, (unsigned long long)maybe_ptr);
+                    }
+                }
+            }
             
             ctree_str_debug("[replace] Name at 0x%llx = '%s', is_cfstring=%d\n",
                            (unsigned long long)str_addr, name_at_addr.c_str(), is_cfstring_struct);
@@ -1298,14 +1350,13 @@ struct encrypted_string_replacer_t : public ctree_visitor_t {
         
         // Try to patch the CFString's string data in the IDB
         // This will make CFSTR() show the decrypted string on re-decompilation
-        // Note: We need to track the actual string data address separately
         if (str_addr != BADADDR) {
-            // Check if this is a CFString struct and get the string pointer
-            qstring name_at;
-            get_name(&name_at, str_addr);
-            if (name_at.find("cfstr_") != qstring::npos || name_at.find("CFString") != qstring::npos) {
-                ea_t string_data_ptr = get_qword(str_addr + 0x10);
-                if (string_data_ptr != 0 && string_data_ptr != BADADDR && is_loaded(string_data_ptr)) {
+            // Get the string pointer from CFString structure at +0x10
+            ea_t string_data_ptr = get_qword(str_addr + 0x10);
+            if (string_data_ptr != 0 && string_data_ptr != BADADDR && is_loaded(string_data_ptr)) {
+                // Verify this pointer points to a known plaintext (i.e., it's a valid CFString)
+                auto it = known_plaintexts.find(string_data_ptr);
+                if (it != known_plaintexts.end()) {
                     // Patch the string data bytes  
                     size_t dec_len = decrypted.length();
                     for (size_t i = 0; i < dec_len; i++) {
