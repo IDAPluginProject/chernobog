@@ -35,8 +35,14 @@ public:
     virtual int apply(mblock_t* blk, minsn_t* jcc) = 0;
 
     // Statistics
-    size_t hit_count() const { return hit_count_; }
-    void increment_hit_count() { hit_count_++; }
+    size_t hit_count() const
+    {
+        return hit_count_;
+    }
+    void increment_hit_count()
+    {
+        ++hit_count_;
+    }
 
 protected:
     size_t hit_count_ = 0;

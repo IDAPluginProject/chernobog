@@ -88,8 +88,8 @@ public:
 
     // Get existing AST by key
     SIMD_FORCE_INLINE AstPtr get(const MopKey& key) const {
-        auto it = mop_to_ast_.find(key);
-        return (it != mop_to_ast_.end()) ? it->second : nullptr;
+        auto p = mop_to_ast_.find(key);
+        return ( p != mop_to_ast_.end() ) ? p->second : nullptr;
     }
 
     // Add new AST to context

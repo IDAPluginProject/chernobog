@@ -142,23 +142,23 @@ struct caller_context_t {
     }
     
     std::optional<uint64_t> get_stack_value(sval_t offset) const {
-        auto it = stack_values.find(offset);
-        if (it != stack_values.end())
-            return it->second;
+        auto p = stack_values.find(offset);
+        if ( p != stack_values.end() )
+            return p->second;
         return std::nullopt;
     }
     
     std::optional<uint64_t> get_register_value(int reg) const {
-        auto it = register_values.find(reg);
-        if (it != register_values.end())
-            return it->second;
+        auto p = register_values.find(reg);
+        if ( p != register_values.end() )
+            return p->second;
         return std::nullopt;
     }
     
     std::optional<uint64_t> get_global_value(ea_t addr) const {
-        auto it = global_values.find(addr);
-        if (it != global_values.end())
-            return it->second;
+        auto p = global_values.find(addr);
+        if ( p != global_values.end() )
+            return p->second;
         return std::nullopt;
     }
 };

@@ -18,7 +18,8 @@
     #define O_TRUNC _O_TRUNC
     
     // Portable popcount - MSVC uses __popcnt
-    inline int portable_popcount(uint32_t val) {
+    inline int portable_popcount(uint32_t val)
+    {
         return (int)__popcnt(val);
     }
     
@@ -32,7 +33,8 @@
     #include <fcntl.h>
     
     // Portable popcount - GCC/Clang use __builtin_popcount
-    inline int portable_popcount(uint32_t val) {
+    inline int portable_popcount(uint32_t val)
+    {
         return __builtin_popcount(val);
     }
     

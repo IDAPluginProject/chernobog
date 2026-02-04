@@ -49,7 +49,10 @@ public:
     void initialize();
 
     // Check if initialized
-    bool is_initialized() const { return initialized_; }
+    bool is_initialized() const
+    {
+        return initialized_;
+    }
 
     // Re-initialize (e.g., after configuration change)
     void reinitialize();
@@ -67,7 +70,10 @@ public:
         std::map<std::string, mop_t> bindings;
 
         MatchResult() : rule(nullptr) {}
-        bool matched() const { return rule != nullptr; }
+        bool matched() const
+        {
+            return rule != nullptr;
+        }
     };
 
     // Find first matching rule for instruction
@@ -81,7 +87,10 @@ public:
     //----------------------------------------------------------------------
 
     // Number of registered rules
-    size_t rule_count() const { return rules_.size(); }
+    size_t rule_count() const
+    {
+        return rules_.size();
+    }
 
     // Number of patterns (including fuzzed variants)
     size_t pattern_count() const;
@@ -90,8 +99,14 @@ public:
     std::map<std::string, size_t> get_hit_statistics() const;
 
     // Total matches performed
-    size_t total_matches() const { return total_matches_; }
-    size_t successful_matches() const { return successful_matches_; }
+    size_t total_matches() const
+    {
+        return total_matches_;
+    }
+    size_t successful_matches() const
+    {
+        return successful_matches_;
+    }
 
     // Clear statistics
     void clear_statistics();

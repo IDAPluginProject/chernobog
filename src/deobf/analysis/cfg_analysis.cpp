@@ -10,13 +10,13 @@ namespace cfg_analysis {
 std::vector<block_info_t> analyze_cfg(mbl_array_t *mba) {
     std::vector<block_info_t> blocks;
 
-    if (!mba)
+    if ( !mba )
         return blocks;
 
     blocks.resize(mba->qty);
 
     // First pass: collect basic info and successors
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
         blocks[i].block_idx = i;
         blocks[i].dominator = -1;
@@ -25,22 +25,22 @@ std::vector<block_info_t> analyze_cfg(mbl_array_t *mba) {
         blocks[i].is_loop_exit = false;
         blocks[i].loop_depth = 0;
 
-        if (!blk)
+        if ( !blk )
             continue;
 
         // Get successors
-        for (int j = 0; j < blk->nsucc(); j++) {
+        for ( int j = 0; j < blk->nsucc(); ++j ) {
             int succ = blk->succ(j);
-            if (succ >= 0 && succ < mba->qty) {
+            if ( succ >= 0 && succ < mba->qty ) {
                 blocks[i].successors.push_back(succ);
             }
         }
     }
 
     // Second pass: compute predecessors from successors
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         for (int succ : blocks[i].successors) {
-            if (succ >= 0 && succ < (int)blocks.size()) {
+            if ( succ >= 0 && succ < (int)blocks.size() ) {
                 blocks[succ].predecessors.push_back(i);
             }
         }
@@ -246,7 +246,7 @@ std::set<int> get_reachable(int from, mbl_array_t *mba) {
         reachable.insert(curr);
 
         mblock_t *blk = mba->get_mblock(curr);
-        if (!blk)
+        if ( !blk )
             continue;
 
         for (int i = 0; i < blk->nsucc(); i++) {
@@ -271,14 +271,14 @@ std::set<int> get_reaching(int to, mbl_array_t *mba) {
 
     // Build predecessor map
     std::vector<std::vector<int>> preds(mba->qty);
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk )
             continue;
 
-        for (int j = 0; j < blk->nsucc(); j++) {
+        for ( int j = 0; j < blk->nsucc(); ++j ) {
             int succ = blk->succ(j);
-            if (succ >= 0 && succ < mba->qty) {
+            if ( succ >= 0 && succ < mba->qty ) {
                 preds[succ].push_back(i);
             }
         }
@@ -311,7 +311,7 @@ std::set<int> get_reaching(int to, mbl_array_t *mba) {
 // Find dispatcher block (for control flow flattening)
 //--------------------------------------------------------------------------
 int find_dispatcher_block(mbl_array_t *mba) {
-    if (!mba)
+    if ( !mba )
         return -1;
 
     // The dispatcher block typically:
@@ -322,9 +322,9 @@ int find_dispatcher_block(mbl_array_t *mba) {
     int best_candidate = -1;
     int max_succs = 0;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk )
             continue;
 
         int nsucc = blk->nsucc();
@@ -363,7 +363,7 @@ int find_dispatcher_block(mbl_array_t *mba) {
 std::vector<int> find_backedge_targets(mbl_array_t *mba) {
     std::vector<int> targets;
 
-    if (!mba)
+    if ( !mba )
         return targets;
 
     auto blocks = analyze_cfg(mba);
@@ -404,7 +404,7 @@ bool is_dead_block(mblock_t *blk, mbl_array_t *mba, deobf_ctx_t *ctx) {
 // Get branch condition for edge
 //--------------------------------------------------------------------------
 minsn_t *get_branch_condition(int from_blk, int to_blk, mbl_array_t *mba) {
-    if (!mba)
+    if ( !mba )
         return nullptr;
 
     mblock_t *blk = mba->get_mblock(from_blk);

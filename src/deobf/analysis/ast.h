@@ -237,8 +237,8 @@ struct MatchBindings {
     }
     
     const mop_t* find(const std::string& name) const {
-        for (size_t i = 0; i < count; i++) {
-            if (name == bindings[i].name) {
+        for ( size_t i = 0; i < count; ++i ) {
+            if ( name == bindings[i].name ) {
                 return &bindings[i].mop;
             }
         }

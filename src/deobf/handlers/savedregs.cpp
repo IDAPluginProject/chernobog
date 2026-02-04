@@ -3,34 +3,36 @@
 //--------------------------------------------------------------------------
 // Detection
 //--------------------------------------------------------------------------
-bool savedregs_handler_t::detect(mbl_array_t *mba) {
-    if (!mba)
+bool savedregs_handler_t::detect(mbl_array_t *mba)
+{
+    if ( !mba ) 
         return false;
 
     int savedregs_refs = 0;
     int indirect_calls = 0;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             // Count savedregs references
             sval_t offset;
-            if (is_savedregs_ref(ins->l, &offset) ||
+            if ( is_savedregs_ref(ins->l, &offset) ||
                 is_savedregs_ref(ins->r, &offset) ||
-                is_savedregs_ref(ins->d, &offset)) {
+                is_savedregs_ref(ins->d, &offset))
+                {
                 savedregs_refs++;
             }
 
             // Count indirect calls through savedregs
-            if (ins->opcode == m_icall || ins->opcode == m_call) {
-                if (ins->l.t == mop_d && ins->l.d) {
+            if ( ins->opcode == m_icall || ins->opcode == m_call ) {
+                if ( ins->l.t == mop_d && ins->l.d ) {
                     // Check if call target is loaded from savedregs
                     minsn_t *inner = ins->l.d;
-                    if (inner->opcode == m_ldx || inner->opcode == m_mov) {
-                        if (is_savedregs_ref(inner->l, &offset)) {
+                    if ( inner->opcode == m_ldx || inner->opcode == m_mov ) {
+                        if ( is_savedregs_ref(inner->l, &offset) ) {
                             indirect_calls++;
                         }
                     }
@@ -46,25 +48,26 @@ bool savedregs_handler_t::detect(mbl_array_t *mba) {
 //--------------------------------------------------------------------------
 // Check if operand is a savedregs reference
 //--------------------------------------------------------------------------
-bool savedregs_handler_t::is_savedregs_ref(const mop_t &op, sval_t *out_offset) {
+bool savedregs_handler_t::is_savedregs_ref(const mop_t &op, sval_t *out_offset)
+{
     // Pattern: &savedregs - N  or  *(&savedregs - N)
     // In microcode: mop_S with negative offset from frame
 
-    if (op.t == mop_S && op.s) {
+    if ( op.t == mop_S && op.s ) {
         // Stack variable reference
         // Savedregs typically have negative offsets from frame base
-        if (op.s->off < 0) {
-            if (out_offset)
+        if ( op.s->off < 0 ) {
+            if ( out_offset ) 
                 *out_offset = op.s->off;
             return true;
         }
     }
 
     // Also check for address expressions
-    if (op.t == mop_a && op.a) {
-        if (op.a->t == mop_S && op.a->s) {
-            if (op.a->s->off < 0) {
-                if (out_offset)
+    if ( op.t == mop_a && op.a ) {
+        if ( op.a->t == mop_S && op.a->s ) {
+            if ( op.a->s->off < 0 ) {
+                if ( out_offset ) 
                     *out_offset = op.a->s->off;
                 return true;
             }
@@ -79,30 +82,30 @@ bool savedregs_handler_t::is_savedregs_ref(const mop_t &op, sval_t *out_offset) 
 //--------------------------------------------------------------------------
 savedregs_handler_t::slot_type_t
 savedregs_handler_t::classify_value(ea_t addr) {
-    if (addr == BADADDR)
+    if ( addr == BADADDR ) 
         return SLOT_UNKNOWN;
 
     // Check if it's a function
     func_t *fn = get_func(addr);
-    if (fn) {
+    if ( fn ) {
         return SLOT_FUNC_PTR;
     }
 
     // Check if address points to code (might be a function start)
     flags64_t flags = get_flags(addr);
-    if (is_code(flags)) {
+    if ( is_code(flags) ) {
         return SLOT_FUNC_PTR;
     }
 
     // Check if it's a string
     size_t len = get_max_strlit_length(addr, STRTYPE_C);
-    if (len > 0 && len < 1024) {
+    if ( len > 0 && len < 1024 ) {
         // Check if it looks like an ObjC selector
         qstring str;
         str.resize(len);
-        if (get_strlit_contents(&str, addr, len, STRTYPE_C) > 0) {
+        if ( get_strlit_contents(&str, addr, len, STRTYPE_C) > 0 ) {
             // ObjC selectors often contain colons
-            if (str.find(':') != qstring::npos) {
+            if ( str.find(':') != qstring::npos ) {
                 return SLOT_SELECTOR;
             }
             return SLOT_STRING;
@@ -115,19 +118,20 @@ savedregs_handler_t::classify_value(ea_t addr) {
 //--------------------------------------------------------------------------
 // Check if address is an objc_msgSend variant
 //--------------------------------------------------------------------------
-bool savedregs_handler_t::is_objc_msgsend(ea_t addr) {
-    if (addr == BADADDR)
+bool savedregs_handler_t::is_objc_msgsend(ea_t addr)
+{
+    if ( addr == BADADDR ) 
         return false;
 
     qstring name;
-    if (get_name(&name, addr) > 0) {
+    if ( get_name(&name, addr) > 0 ) {
         // Check various objc_msgSend variants
-        if (name.find("objc_msgSend") != qstring::npos)
+        if ( name.find("objc_msgSend") != qstring::npos ) 
             return true;
-        if (name.find("_objc_msgSend") != qstring::npos)
+        if ( name.find("_objc_msgSend") != qstring::npos ) 
             return true;
         // Also check for mangled names
-        if (name.find("msgSend") != qstring::npos)
+        if ( name.find("msgSend") != qstring::npos ) 
             return true;
     }
 
@@ -141,21 +145,21 @@ void savedregs_handler_t::analyze_savedregs_writes(
     mbl_array_t *mba,
     std::map<sval_t, slot_info_ext_t> &slots)
 {
-    if (!mba)
+    if ( !mba ) 
         return;
 
     slots.clear();
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             // Look for writes to savedregs slots
-            if (ins->opcode == m_mov || ins->opcode == m_stx) {
+            if ( ins->opcode == m_mov || ins->opcode == m_stx ) {
                 sval_t offset;
-                if (!is_savedregs_ref(ins->d, &offset))
+                if ( !is_savedregs_ref(ins->d, &offset) ) 
                     continue;
 
                 slot_info_ext_t info;
@@ -166,23 +170,23 @@ void savedregs_handler_t::analyze_savedregs_writes(
                 info.is_objc_msgsend = false;
 
                 // Analyze source operand
-                if (ins->l.t == mop_n) {
+                if ( ins->l.t == mop_n ) {
                     // Immediate value
                     info.type = SLOT_VALUE;
                     info.value = ins->l.nnn->value;
                 }
-                else if (ins->l.t == mop_v) {
+                else if ( ins->l.t == mop_v ) {
                     // Global address
                     ea_t addr = ins->l.g;
                     info.type = classify_value(addr);
 
-                    if (info.type == SLOT_FUNC_PTR) {
+                    if ( info.type == SLOT_FUNC_PTR ) {
                         info.func_addr = addr;
                         info.is_objc_msgsend = is_objc_msgsend(addr);
                     }
-                    else if (info.type == SLOT_STRING || info.type == SLOT_SELECTOR) {
+                    else if ( info.type == SLOT_STRING || info.type == SLOT_SELECTOR ) {
                         size_t len = get_max_strlit_length(addr, STRTYPE_C);
-                        if (len > 0 && len < 1024) {
+                        if ( len > 0 && len < 1024 ) {
                             info.string_val.resize(len);
                             get_strlit_contents(&info.string_val, addr, len, STRTYPE_C);
                         }
@@ -191,19 +195,19 @@ void savedregs_handler_t::analyze_savedregs_writes(
                         info.value = addr;
                     }
                 }
-                else if (ins->l.t == mop_a && ins->l.a) {
+                else if ( ins->l.t == mop_a && ins->l.a ) {
                     // Address expression &something
-                    if (ins->l.a->t == mop_v) {
+                    if ( ins->l.a->t == mop_v ) {
                         ea_t addr = ins->l.a->g;
                         info.type = classify_value(addr);
 
-                        if (info.type == SLOT_FUNC_PTR) {
+                        if ( info.type == SLOT_FUNC_PTR ) {
                             info.func_addr = addr;
                             info.is_objc_msgsend = is_objc_msgsend(addr);
                         }
-                        else if (info.type == SLOT_STRING || info.type == SLOT_SELECTOR) {
+                        else if ( info.type == SLOT_STRING || info.type == SLOT_SELECTOR ) {
                             size_t len = get_max_strlit_length(addr, STRTYPE_C);
-                            if (len > 0 && len < 1024) {
+                            if ( len > 0 && len < 1024 ) {
                                 info.string_val.resize(len);
                                 get_strlit_contents(&info.string_val, addr, len, STRTYPE_C);
                             }
@@ -227,11 +231,11 @@ bool savedregs_handler_t::resolve_indirect_call(
     const std::map<sval_t, slot_info_ext_t> &slots,
     resolved_call_t *out)
 {
-    if (!blk || !call_insn || !out)
+    if ( !blk || !call_insn || !out ) 
         return false;
 
     // Check if this is an indirect call
-    if (call_insn->opcode != m_icall && call_insn->opcode != m_call)
+    if ( call_insn->opcode != m_icall && call_insn->opcode != m_call ) 
         return false;
 
     // Get the call target
@@ -239,29 +243,29 @@ bool savedregs_handler_t::resolve_indirect_call(
     bool found_target = false;
 
     // Check direct savedregs reference in call target
-    if (is_savedregs_ref(call_insn->l, &target_offset)) {
+    if ( is_savedregs_ref(call_insn->l, &target_offset) ) {
         found_target = true;
     }
     // Check nested instruction (ldx/mov from savedregs)
-    else if (call_insn->l.t == mop_d && call_insn->l.d) {
+    else if ( call_insn->l.t == mop_d && call_insn->l.d ) {
         minsn_t *inner = call_insn->l.d;
-        if (inner->opcode == m_ldx || inner->opcode == m_mov) {
-            if (is_savedregs_ref(inner->l, &target_offset)) {
+        if ( inner->opcode == m_ldx || inner->opcode == m_mov ) {
+            if ( is_savedregs_ref(inner->l, &target_offset) ) {
                 found_target = true;
             }
         }
     }
 
-    if (!found_target)
+    if ( !found_target ) 
         return false;
 
     // Look up the target in our slot map
-    auto it = slots.find(target_offset);
-    if (it == slots.end())
+    auto p = slots.find(target_offset);
+    if ( p == slots.end() ) 
         return false;
 
-    const slot_info_ext_t &slot = it->second;
-    if (slot.type != SLOT_FUNC_PTR || slot.func_addr == BADADDR)
+    const slot_info_ext_t &slot = p->second;
+    if ( slot.type != SLOT_FUNC_PTR || slot.func_addr == BADADDR ) 
         return false;
 
     // Fill in resolved call info
@@ -286,32 +290,32 @@ bool savedregs_handler_t::extract_call_args(
     const std::map<sval_t, slot_info_ext_t> &slots,
     resolved_call_t *out)
 {
-    if (!call_insn || !out)
+    if ( !call_insn || !out ) 
         return false;
 
     out->args.clear();
     out->selector.clear();
 
     // For icall, arguments are in the r operand as mcallargs_t
-    if (call_insn->opcode == m_icall) {
-        if (call_insn->d.t == mop_f && call_insn->d.f) {
+    if ( call_insn->opcode == m_icall ) {
+        if ( call_insn->d.t == mop_f && call_insn->d.f ) {
             mcallinfo_t *ci = call_insn->d.f;
 
             // Iterate through call arguments
-            for (size_t i = 0; i < ci->args.size(); i++) {
+            for ( size_t i = 0; i < ci->args.size(); ++i ) {
                 mcallarg_t &arg = ci->args[i];
 
                 sval_t offset;
-                if (is_savedregs_ref(arg, &offset)) {
-                    auto it = slots.find(offset);
-                    if (it != slots.end()) {
-                        const slot_info_ext_t &slot = it->second;
+                if ( is_savedregs_ref(arg, &offset) ) {
+                    auto p = slots.find(offset);
+                    if ( p != slots.end() ) {
+                        const slot_info_ext_t &slot = p->second;
 
-                        if (slot.type == SLOT_STRING || slot.type == SLOT_SELECTOR) {
+                        if ( slot.type == SLOT_STRING || slot.type == SLOT_SELECTOR ) {
                             out->args.push_back(slot.string_val);
 
                             // For ObjC calls, the selector is typically arg 1 (after self)
-                            if (out->is_objc && i == 1 && slot.type == SLOT_SELECTOR) {
+                            if ( out->is_objc && i == 1 && slot.type == SLOT_SELECTOR ) {
                                 out->selector = slot.string_val;
                             }
                         }
@@ -332,7 +336,7 @@ bool savedregs_handler_t::transform_call(
     minsn_t *call_insn,
     const resolved_call_t &resolved)
 {
-    if (!blk || !call_insn)
+    if ( !blk || !call_insn ) 
         return false;
 
     // For now, we just annotate rather than transform
@@ -353,7 +357,7 @@ bool savedregs_handler_t::transform_call(
 qstring savedregs_handler_t::format_objc_call(const resolved_call_t &resolved) {
     qstring result;
 
-    if (!resolved.selector.empty()) {
+    if ( !resolved.selector.empty() ) {
         // Format: [obj selector:arg1 param2:arg2 ...]
         // For now, just show the selector
         result.sprnt("[... %s]", resolved.selector.c_str());
@@ -368,15 +372,16 @@ qstring savedregs_handler_t::format_objc_call(const resolved_call_t &resolved) {
 //--------------------------------------------------------------------------
 // Annotate a resolved call
 //--------------------------------------------------------------------------
-void savedregs_handler_t::annotate_call(ea_t call_addr, const resolved_call_t &resolved) {
-    if (call_addr == BADADDR)
+void savedregs_handler_t::annotate_call(ea_t call_addr, const resolved_call_t &resolved)
+{
+    if ( call_addr == BADADDR ) 
         return;
 
     qstring comment;
 
-    if (resolved.is_objc) {
+    if ( resolved.is_objc ) {
         // ObjC-style annotation
-        if (!resolved.selector.empty()) {
+        if ( !resolved.selector.empty() ) {
             comment.sprnt("DEOBF: ObjC call - [obj %s]", resolved.selector.c_str());
         }
         else {
@@ -391,8 +396,8 @@ void savedregs_handler_t::annotate_call(ea_t call_addr, const resolved_call_t &r
     }
 
     // Add string arguments to comment
-    for (size_t i = 0; i < resolved.args.size(); i++) {
-        if (i == 0 && resolved.is_objc && resolved.args[i] == resolved.selector)
+    for ( size_t i = 0; i < resolved.args.size(); ++i ) {
+        if ( i == 0 && resolved.is_objc && resolved.args[i] == resolved.selector ) 
             continue;  // Skip selector, already shown
 
         qstring arg_comment;
@@ -407,8 +412,9 @@ void savedregs_handler_t::annotate_call(ea_t call_addr, const resolved_call_t &r
 //--------------------------------------------------------------------------
 // Main processing
 //--------------------------------------------------------------------------
-int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
-    if (!mba || !ctx)
+int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx)
+{
+    if ( !mba || !ctx ) 
         return 0;
 
     int changes = 0;
@@ -417,7 +423,7 @@ int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     std::map<sval_t, slot_info_ext_t> slots;
     analyze_savedregs_writes(mba, slots);
 
-    if (slots.empty()) {
+    if ( slots.empty() ) {
         deobf::log("[savedregs] No savedregs slots found\n");
         return 0;
     }
@@ -425,9 +431,9 @@ int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     deobf::log("[savedregs] Found %d savedregs slots\n", (int)slots.size());
 
     // Log interesting slots
-    for (const auto &pair : slots) {
+    for ( const auto &pair : slots ) {
         const slot_info_ext_t &slot = pair.second;
-        switch (slot.type) {
+        switch ( slot.type ) {
             case SLOT_FUNC_PTR:
                 deobf::log("[savedregs]   offset %d: func %s (0x%llX)%s\n",
                           (int)slot.offset,
@@ -451,15 +457,15 @@ int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     // Step 2: Find and resolve indirect calls through savedregs
     std::vector<resolved_call_t> resolved_calls;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-            if (ins->opcode == m_icall || ins->opcode == m_call) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
+            if ( ins->opcode == m_icall || ins->opcode == m_call ) {
                 resolved_call_t resolved;
-                if (resolve_indirect_call(blk, ins, slots, &resolved)) {
+                if ( resolve_indirect_call(blk, ins, slots, &resolved) ) {
                     resolved_calls.push_back(resolved);
                     changes++;
                 }
@@ -470,10 +476,10 @@ int savedregs_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     deobf::log("[savedregs] Resolved %d indirect calls\n", (int)resolved_calls.size());
 
     // Step 3: Annotate resolved calls
-    for (const auto &resolved : resolved_calls) {
+    for ( const auto &resolved : resolved_calls ) {
         annotate_call(resolved.call_addr, resolved);
 
-        if (resolved.is_objc) {
+        if ( resolved.is_objc ) {
             deobf::log("[savedregs]   0x%llX: %s\n",
                       (unsigned long long)resolved.call_addr,
                       format_objc_call(resolved).c_str());

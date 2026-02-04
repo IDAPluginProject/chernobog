@@ -481,7 +481,7 @@ private:
         int body_block;         // Main body block
         int exit_block;         // Exit target
         int back_edge_block;    // Block with back edge (if any)
-        bool is_fake_infinite;  // while(true) with guaranteed break
+        bool is_fake_infinite;  // while (  true ) with guaranteed break
         bool is_never_entered;  // Condition always false on entry
         bool is_single_iteration; // Executes exactly once
         ea_t header_addr;

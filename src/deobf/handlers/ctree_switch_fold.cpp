@@ -5,11 +5,12 @@
 //--------------------------------------------------------------------------
 // Helper: Find a case value in ccases_t (since SDK function may not be exported)
 //--------------------------------------------------------------------------
-static int find_case_value(const ccases_t &cases, uint64_t v) {
-    for (size_t i = 0; i < cases.size(); i++) {
+static int find_case_value(const ccases_t &cases, uint64_t v)
+{
+    for ( size_t i = 0; i < cases.size(); ++i ) {
         const ccase_t &c = cases[i];
-        for (size_t j = 0; j < c.values.size(); j++) {
-            if (c.values[j] == v)
+        for ( size_t j = 0; j < c.values.size(); ++j ) {
+            if ( c.values[j] == v ) 
                 return (int)i;
         }
     }
@@ -20,29 +21,30 @@ static int find_case_value(const ccases_t &cases, uint64_t v) {
 // Helper: Check if an expression is a high-bits extraction (HIDWORD pattern)
 // Returns true if expr is (x >> 32) or similar high-bits extraction
 //--------------------------------------------------------------------------
-static bool is_hidword_expr(const cexpr_t *e, int *base_var_idx = nullptr) {
-    if (!e)
+static bool is_hidword_expr(const cexpr_t *e, int *base_var_idx = nullptr)
+{
+    if ( !e ) 
         return false;
 
     // Pattern: (x >> 32) - unsigned or signed shift by 32
-    if ((e->op == cot_ushr || e->op == cot_sshr) && e->y && e->y->op == cot_num) {
+    if ( (e->op == cot_ushr || e->op == cot_sshr) && e->y && e->y->op == cot_num ) {
         uint64_t shift = e->y->numval();
-        if (shift == 32 && e->x) {
-            if (base_var_idx && e->x->op == cot_var)
+        if ( shift == 32 && e->x ) {
+            if ( base_var_idx && e->x->op == cot_var ) 
                 *base_var_idx = e->x->v.idx;
             return true;
         }
     }
 
     // Pattern: cast((x >> 32))
-    if (e->op == cot_cast && e->x) {
+    if ( e->op == cot_cast && e->x ) {
         return is_hidword_expr(e->x, base_var_idx);
     }
 
     // Pattern: (x >> 32) & 0xFFFFFFFF
-    if (e->op == cot_band && e->y && e->y->op == cot_num) {
+    if ( e->op == cot_band && e->y && e->y->op == cot_num ) {
         uint64_t mask = e->y->numval();
-        if (mask == 0xFFFFFFFF && e->x) {
+        if ( mask == 0xFFFFFFFF && e->x ) {
             return is_hidword_expr(e->x, base_var_idx);
         }
     }
@@ -54,20 +56,20 @@ static bool is_hidword_expr(const cexpr_t *e, int *base_var_idx = nullptr) {
 // Helper: Try to evaluate a switch expression to a constant
 //--------------------------------------------------------------------------
 static bool try_eval_switch_expr(const cexpr_t *e, uint64_t *out_val) {
-    if (!e || !out_val)
+    if ( !e || !out_val ) 
         return false;
 
     // Direct constant
-    if (e->op == cot_num) {
+    if ( e->op == cot_num ) {
         *out_val = e->numval();
         return true;
     }
 
     // Cast of constant
-    if (e->op == cot_cast && e->x && e->x->op == cot_num) {
+    if ( e->op == cot_cast && e->x && e->x->op == cot_num ) {
         *out_val = e->x->numval();
         int size = e->type.get_size();
-        if (size > 0 && size < 8) {
+        if ( size > 0 && size < 8 ) {
             uint64_t mask = (1ULL << (size * 8)) - 1;
             *out_val &= mask;
         }
@@ -87,11 +89,11 @@ struct break_remover_t : public ctree_visitor_t {
     break_remover_t() : ctree_visitor_t(CV_PARENTS) {}
 
     int idaapi visit_insn(cinsn_t *ins) override {
-        if (!ins)
+        if ( !ins ) 
             return 0;
 
         // Remove break statements by converting to empty block
-        if (ins->op == cit_break) {
+        if ( ins->op == cit_break ) {
             ins->op = cit_empty;
             removed++;
         }
@@ -115,31 +117,32 @@ struct var_tracker_visitor_t : public ctree_visitor_t {
     var_tracker_visitor_t(cfunc_t *f) : ctree_visitor_t(CV_FAST), func(f) {}
 
     int idaapi visit_expr(cexpr_t *e) override {
-        if (!e)
+        if ( !e ) 
             return 0;
 
         // Look for assignments: var = value
-        if (e->op == cot_asg && e->x && e->y && e->x->op == cot_var) {
+        if ( e->op == cot_asg && e->x && e->y && e->x->op == cot_var ) {
             int var_idx = e->x->v.idx;
 
             // Direct constant assignment
-            if (e->y->op == cot_num) {
+            if ( e->y->op == cot_num ) {
                 uint64_t val = e->y->numval();
                 var_full_values[var_idx].insert(val);
 
                 // Track high 32 bits for 64-bit values
-                if (e->x->type.get_size() == 8) {
+                if ( e->x->type.get_size() == 8 ) {
                     uint64_t hidword = val >> 32;
                     var_hidword_values[var_idx].insert(hidword);
                 }
             }
 
             // OR assignment: var |= (const << 32) - sets HIDWORD
-            if (e->op == cot_asgbor && e->y->op == cot_shl) {
+            if ( e->op == cot_asgbor && e->y->op == cot_shl ) {
                 cexpr_t *shl = e->y;
-                if (shl->x && shl->x->op == cot_num &&
+                if ( shl->x && shl->x->op == cot_num &&
                     shl->y && shl->y->op == cot_num &&
-                    shl->y->numval() == 32) {
+                    shl->y->numval() == 32)
+                    {
                     var_hidword_values[var_idx].insert(shl->x->numval());
                 }
             }
@@ -150,10 +153,10 @@ struct var_tracker_visitor_t : public ctree_visitor_t {
 
     // Check if a variable's HIDWORD is always the same constant
     bool get_constant_hidword(int var_idx, uint64_t *out_val) const {
-        auto it = var_hidword_values.find(var_idx);
-        if (it != var_hidword_values.end() && it->second.size() == 1) {
-            if (out_val)
-                *out_val = *it->second.begin();
+        auto p = var_hidword_values.find(var_idx);
+        if ( p != var_hidword_values.end() && p->second.size() == 1 ) {
+            if ( out_val ) 
+                *out_val = *p->second.begin();
             return true;
         }
         return false;
@@ -172,7 +175,7 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
         : ctree_visitor_t(CV_PARENTS), func(f), tracker(t) {}
 
     int idaapi visit_insn(cinsn_t *ins) override {
-        if (!ins || ins->op != cit_switch || !ins->cswitch)
+        if ( !ins || ins->op != cit_switch || !ins->cswitch ) 
             return 0;
 
         cswitch_t *sw = ins->cswitch;
@@ -188,20 +191,20 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
         bool is_constant = false;
 
         // Check if switch expression is a direct constant
-        if (try_eval_switch_expr(switch_expr, &const_val)) {
+        if ( try_eval_switch_expr(switch_expr, &const_val) ) {
             is_constant = true;
             deobf::log("[ctree_switch_fold] Switch expression is constant: 0x%llx\n",
                       (unsigned long long)const_val);
         }
 
-        // Check for (cast)&object pattern - this is a constant address
+        // Check for ( cast )&object pattern - this is a constant address
         // Pattern: cot_cast(cot_ref(cot_obj))
-        if (!is_constant && switch_expr->op == cot_cast && switch_expr->x) {
+        if ( !is_constant && switch_expr->op == cot_cast && switch_expr->x ) {
             cexpr_t *inner = switch_expr->x;
-            if (inner->op == cot_ref && inner->x && inner->x->op == cot_obj) {
+            if ( inner->op == cot_ref && inner->x && inner->x->op == cot_obj ) {
                 // This is &object - get the object address
                 ea_t obj_addr = inner->x->obj_ea;
-                if (obj_addr != BADADDR) {
+                if ( obj_addr != BADADDR ) {
                     const_val = (uint64_t)obj_addr;
                     is_constant = true;
                     deobf::log("[ctree_switch_fold] Switch on &object: addr 0x%llx\n",
@@ -212,30 +215,30 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
 
         // Check for HIDWORD pattern with constant
         int hidword_var = -1;
-        if (!is_constant && is_hidword_expr(switch_expr, &hidword_var)) {
-            if (hidword_var >= 0 && tracker.get_constant_hidword(hidword_var, &const_val)) {
+        if ( !is_constant && is_hidword_expr(switch_expr, &hidword_var) ) {
+            if ( hidword_var >= 0 && tracker.get_constant_hidword(hidword_var, &const_val) ) {
                 is_constant = true;
                 deobf::log("[ctree_switch_fold] HIDWORD(var%d) is always 0x%llx\n",
                           hidword_var, (unsigned long long)const_val);
             }
         }
 
-        if (!is_constant)
+        if ( !is_constant ) 
             return 0;
 
         // Find the matching case
         int matching_idx = find_case_value(sw->cases, const_val);
-        if (matching_idx < 0) {
+        if ( matching_idx < 0 ) {
             // Check for default case
-            for (size_t i = 0; i < sw->cases.size(); i++) {
-                if (sw->cases[i].values.empty()) {
+            for ( size_t i = 0; i < sw->cases.size(); ++i ) {
+                if ( sw->cases[i].values.empty() ) {
                     matching_idx = (int)i;
                     break;
                 }
             }
         }
 
-        if (matching_idx < 0) {
+        if ( matching_idx < 0 ) {
             deobf::log("[ctree_switch_fold] No matching case for value 0x%llx\n",
                       (unsigned long long)const_val);
             return 0;
@@ -252,7 +255,7 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
         // Remove break statements from the case body
         break_remover_t remover;
         remover.apply_to(&matching_case, nullptr);
-        if (remover.removed > 0) {
+        if ( remover.removed > 0 ) {
             deobf::log_verbose("[ctree_switch_fold] Removed %d break statements\n", remover.removed);
         }
 
@@ -265,7 +268,7 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
         ins->label_num = case_body->label_num;
 
         // Copy the appropriate union member based on op type
-        switch (case_body->op) {
+        switch ( case_body->op ) {
             case cit_block:
                 ins->cblock = case_body->cblock;
                 case_body->cblock = nullptr;  // Transfer ownership
@@ -320,7 +323,7 @@ struct switch_fold_visitor_t : public ctree_visitor_t {
 // Main entry point
 //--------------------------------------------------------------------------
 int ctree_switch_fold_handler_t::run(cfunc_t *cfunc) {
-    if (!cfunc)
+    if ( !cfunc ) 
         return 0;
 
     deobf::log_verbose("[ctree_switch_fold] Running on %a\n", cfunc->entry_ea);
@@ -330,8 +333,8 @@ int ctree_switch_fold_handler_t::run(cfunc_t *cfunc) {
     tracker.apply_to(&cfunc->body, nullptr);
 
     // Log any variables with constant HIDWORD values
-    for (const auto &kv : tracker.var_hidword_values) {
-        if (kv.second.size() == 1) {
+    for ( const auto &kv : tracker.var_hidword_values ) {
+        if ( kv.second.size() == 1 ) {
             deobf::log_verbose("[ctree_switch_fold] var%d has constant HIDWORD: 0x%llx\n",
                       kv.first, (unsigned long long)*kv.second.begin());
         }
@@ -341,7 +344,7 @@ int ctree_switch_fold_handler_t::run(cfunc_t *cfunc) {
     switch_fold_visitor_t folder(cfunc, tracker);
     folder.apply_to(&cfunc->body, nullptr);
 
-    if (folder.changes > 0) {
+    if ( folder.changes > 0 ) {
         deobf::log("[ctree_switch_fold] Folded %d switches\n", folder.changes);
         // Verify the ctree after modification
         cfunc->verify(ALLOW_UNUSED_LABELS, false);

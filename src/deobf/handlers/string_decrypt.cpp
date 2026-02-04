@@ -4,25 +4,27 @@
 //--------------------------------------------------------------------------
 // Detection
 //--------------------------------------------------------------------------
-bool string_decrypt_handler_t::detect(ea_t func_ea) {
+bool string_decrypt_handler_t::detect(ea_t func_ea)
+{
     // Look for Hikari string encryption markers in the binary
 
     // Check for EncryptedString/DecryptSpace globals
     segment_t *seg = get_first_seg();
-    while (seg) {
-        if (seg->type == SEG_DATA) {
+    while ( seg ) {
+        if ( seg->type == SEG_DATA ) {
             ea_t ea = seg->start_ea;
-            while (ea < seg->end_ea) {
+            while ( ea < seg->end_ea ) {
                 qstring name;
-                if (get_name(&name, ea) > 0) {
-                    if (name.find("EncryptedString") != qstring::npos ||
+                if ( get_name(&name, ea) > 0 ) {
+                    if ( name.find("EncryptedString") != qstring::npos ||
                         name.find("DecryptSpace") != qstring::npos ||
-                        name.find("StringEncryptionEncStatus") != qstring::npos) {
+                        name.find("StringEncryptionEncStatus") != qstring::npos)
+                        {
                         return true;
                     }
                 }
                 ea = next_head(ea, seg->end_ea);
-                if (ea == BADADDR)
+                if ( ea == BADADDR ) 
                     break;
             }
         }
@@ -35,8 +37,9 @@ bool string_decrypt_handler_t::detect(ea_t func_ea) {
 //--------------------------------------------------------------------------
 // Main deobfuscation pass
 //--------------------------------------------------------------------------
-int string_decrypt_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
-    if (!mba || !ctx)
+int string_decrypt_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx)
+{
+    if ( !mba || !ctx ) 
         return 0;
 
     deobf::log("[string_decrypt] Starting string decryption\n");
@@ -48,9 +51,9 @@ int string_decrypt_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     deobf::log("[string_decrypt] Found %zu potential encrypted strings\n",
               encrypted_strings.size());
 
-    for (auto &str : encrypted_strings) {
+    for ( auto &str : encrypted_strings ) {
         // Try to extract XOR keys
-        if (!extract_xor_keys(mba, &str)) {
+        if ( !extract_xor_keys(mba, &str) ) {
             deobf::log_verbose("[string_decrypt] Could not extract keys for %a\n",
                               str.encrypted_addr);
             continue;
@@ -58,7 +61,7 @@ int string_decrypt_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 
         // Decrypt the string
         std::string decrypted = decrypt_string(str);
-        if (decrypted.empty())
+        if ( decrypted.empty() ) 
             continue;
 
         deobf::log("[string_decrypt] Decrypted string at %a: \"%s\"\n",
@@ -84,28 +87,29 @@ int string_decrypt_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 // Find encrypted strings
 //--------------------------------------------------------------------------
 std::vector<string_decrypt_handler_t::encrypted_string_t>
-string_decrypt_handler_t::find_encrypted_strings(ea_t func_ea) {
+string_decrypt_handler_t::find_encrypted_strings(ea_t func_ea)
+{
 
     std::vector<encrypted_string_t> result;
 
     // Scan data segments for EncryptedString patterns
     segment_t *seg = get_first_seg();
-    while (seg) {
-        if (seg->type == SEG_DATA) {
+    while ( seg ) {
+        if ( seg->type == SEG_DATA ) {
             ea_t ea = seg->start_ea;
-            while (ea < seg->end_ea) {
+            while ( ea < seg->end_ea ) {
                 qstring name;
-                if (get_name(&name, ea) > 0) {
-                    if (name.find("EncryptedString") != qstring::npos) {
+                if ( get_name(&name, ea) > 0 ) {
+                    if ( name.find("EncryptedString") != qstring::npos ) {
                         encrypted_string_t str;
                         str.encrypted_addr = ea;
                         str.element_size = 1;  // Default to byte
 
                         // Try to find the size from the type
                         tinfo_t ti;
-                        if (get_tinfo(&ti, ea)) {
+                        if ( get_tinfo(&ti, ea) ) {
                             str.element_size = ti.get_size();
-                            if (str.element_size == 0 || str.element_size > 8)
+                            if ( str.element_size == 0 || str.element_size > 8 ) 
                                 str.element_size = 1;
                         }
 
@@ -113,7 +117,7 @@ string_decrypt_handler_t::find_encrypted_strings(ea_t func_ea) {
                         size_t max_size = 1024;
                         str.encrypted_data.resize(max_size);
                         ssize_t read = get_bytes(str.encrypted_data.data(), max_size, ea);
-                        if (read > 0) {
+                        if ( read > 0 ) {
                             str.encrypted_data.resize(read);
 
                             // Look for corresponding DecryptSpace
@@ -126,7 +130,7 @@ string_decrypt_handler_t::find_encrypted_strings(ea_t func_ea) {
                     }
                 }
                 ea = next_head(ea, seg->end_ea);
-                if (ea == BADADDR)
+                if ( ea == BADADDR ) 
                     break;
             }
         }
@@ -139,8 +143,9 @@ string_decrypt_handler_t::find_encrypted_strings(ea_t func_ea) {
 //--------------------------------------------------------------------------
 // Extract XOR keys from decryption code
 //--------------------------------------------------------------------------
-bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_string_t *str) {
-    if (!mba || !str)
+bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_string_t *str)
+{
+    if ( !mba || !str ) 
         return false;
 
     // Look for XOR instructions that reference the encrypted address
@@ -148,13 +153,13 @@ bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_stri
 
     std::map<size_t, uint8_t> key_map;  // offset -> key
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-            if (ins->opcode != m_xor)
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
+            if ( ins->opcode != m_xor ) 
                 continue;
 
             // Check if one operand is from encrypted address
@@ -165,13 +170,14 @@ bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_stri
             bool found = false;
 
             // Check left operand for global reference
-            if (ins->l.t == mop_v) {
+            if ( ins->l.t == mop_v ) {
                 // Direct global variable access
                 ea_t gv_addr = ins->l.g;
-                if (gv_addr >= str->encrypted_addr &&
-                    gv_addr < str->encrypted_addr + str->encrypted_data.size()) {
+                if ( gv_addr >= str->encrypted_addr &&
+                    gv_addr < str->encrypted_addr + str->encrypted_data.size())
+                    {
                     ref_addr = gv_addr;
-                    if (ins->r.t == mop_n) {
+                    if ( ins->r.t == mop_n ) {
                         key_val = ins->r.nnn->value;
                         found = true;
                     }
@@ -179,19 +185,20 @@ bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_stri
             }
 
             // Check right operand similarly
-            if (!found && ins->r.t == mop_v) {
+            if ( !found && ins->r.t == mop_v ) {
                 ea_t gv_addr = ins->r.g;
-                if (gv_addr >= str->encrypted_addr &&
-                    gv_addr < str->encrypted_addr + str->encrypted_data.size()) {
+                if ( gv_addr >= str->encrypted_addr &&
+                    gv_addr < str->encrypted_addr + str->encrypted_data.size())
+                    {
                     ref_addr = gv_addr;
-                    if (ins->l.t == mop_n) {
+                    if ( ins->l.t == mop_n ) {
                         key_val = ins->l.nnn->value;
                         found = true;
                     }
                 }
             }
 
-            if (found && ref_addr != BADADDR) {
+            if ( found && ref_addr != BADADDR ) {
                 size_t offset = ref_addr - str->encrypted_addr;
                 key_map[offset] = (uint8_t)key_val;
             }
@@ -199,15 +206,15 @@ bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_stri
     }
 
     // If we found keys, populate the keys vector
-    if (!key_map.empty()) {
+    if ( !key_map.empty() ) {
         size_t max_offset = 0;
-        for (const auto &p : key_map) {
-            if (p.first > max_offset)
+        for ( const auto &p : key_map ) {
+            if ( p.first > max_offset ) 
                 max_offset = p.first;
         }
 
         str->xor_keys.resize(max_offset + 1, 0);
-        for (const auto &p : key_map) {
+        for ( const auto &p : key_map ) {
             str->xor_keys[p.first] = p.second;
         }
 
@@ -223,8 +230,9 @@ bool string_decrypt_handler_t::extract_xor_keys(mbl_array_t *mba, encrypted_stri
 //--------------------------------------------------------------------------
 // Decrypt string
 //--------------------------------------------------------------------------
-std::string string_decrypt_handler_t::decrypt_string(const encrypted_string_t &str) {
-    if (str.encrypted_data.empty())
+std::string string_decrypt_handler_t::decrypt_string(const encrypted_string_t &str)
+{
+    if ( str.encrypted_data.empty() ) 
         return "";
 
     std::string result;
@@ -232,17 +240,17 @@ std::string string_decrypt_handler_t::decrypt_string(const encrypted_string_t &s
     // XOR each element with its key
     size_t len = std::min(str.encrypted_data.size(), str.xor_keys.size());
 
-    for (size_t i = 0; i < len; i++) {
+    for ( size_t i = 0; i < len; ++i ) {
         uint8_t decrypted = str.encrypted_data[i] ^ str.xor_keys[i];
 
         // Stop at null terminator
-        if (decrypted == 0)
+        if ( decrypted == 0 ) 
             break;
 
         // Check for printable ASCII
-        if (decrypted >= 32 && decrypted < 127) {
+        if ( decrypted >= 32 && decrypted < 127 ) {
             result += (char)decrypted;
-        } else if (decrypted == '\n' || decrypted == '\t' || decrypted == '\r') {
+        } else if ( decrypted == '\n' || decrypted == '\t' || decrypted == '\r' ) {
             result += (char)decrypted;
         } else {
             // Non-printable - might be end of string or corruption
@@ -257,30 +265,31 @@ std::string string_decrypt_handler_t::decrypt_string(const encrypted_string_t &s
 // Patch string references in microcode
 //--------------------------------------------------------------------------
 int string_decrypt_handler_t::patch_string_references(mbl_array_t *mba,
-    const encrypted_string_t &str, const std::string &decrypted, deobf_ctx_t *ctx) {
+    const encrypted_string_t &str, const std::string &decrypted, deobf_ctx_t *ctx)
+    {
 
     int changes = 0;
 
     // Find references to encrypted/decrypt_space addresses
     // Replace with the decrypted string representation
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             // Check if instruction references the encrypted string
             bool refs_encrypted = false;
 
-            if (ins->l.t == mop_v && ins->l.g == str.encrypted_addr)
+            if ( ins->l.t == mop_v && ins->l.g == str.encrypted_addr ) 
                 refs_encrypted = true;
-            if (ins->r.t == mop_v && ins->r.g == str.encrypted_addr)
+            if ( ins->r.t == mop_v && ins->r.g == str.encrypted_addr ) 
                 refs_encrypted = true;
-            if (ins->d.t == mop_v && ins->d.g == str.encrypted_addr)
+            if ( ins->d.t == mop_v && ins->d.g == str.encrypted_addr ) 
                 refs_encrypted = true;
 
-            if (refs_encrypted) {
+            if ( refs_encrypted ) {
                 // Add comment with decrypted string
                 // (Actual value replacement is complex in microcode)
                 changes++;
@@ -295,7 +304,8 @@ int string_decrypt_handler_t::patch_string_references(mbl_array_t *mba,
 // Annotate decrypted string in IDA
 //--------------------------------------------------------------------------
 void string_decrypt_handler_t::annotate_string(const encrypted_string_t &str,
-    const std::string &decrypted) {
+    const std::string &decrypted)
+    {
 
     // Add comment at encrypted string location
     qstring comment;
@@ -303,7 +313,7 @@ void string_decrypt_handler_t::annotate_string(const encrypted_string_t &str,
     set_cmt(str.encrypted_addr, comment.c_str(), true);
 
     // Also comment at decrypt space if available
-    if (str.decrypt_space_addr != BADADDR) {
+    if ( str.decrypt_space_addr != BADADDR ) {
         set_cmt(str.decrypt_space_addr, comment.c_str(), true);
     }
 }
@@ -311,8 +321,9 @@ void string_decrypt_handler_t::annotate_string(const encrypted_string_t &str,
 //--------------------------------------------------------------------------
 // Find decryption block
 //--------------------------------------------------------------------------
-int string_decrypt_handler_t::find_decryption_block(mbl_array_t *mba) {
-    if (!mba)
+int string_decrypt_handler_t::find_decryption_block(mbl_array_t *mba)
+{
+    if ( !mba ) 
         return -1;
 
     // Look for block with multiple XOR instructions and atomic load
@@ -321,16 +332,16 @@ int string_decrypt_handler_t::find_decryption_block(mbl_array_t *mba) {
     int best_block = -1;
     int best_score = 0;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
         int xor_count = 0;
         bool has_atomic = false;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-            if (ins->opcode == m_xor)
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
+            if ( ins->opcode == m_xor ) 
                 xor_count++;
 
             // Check for atomic operations (indicated by memory ordering)
@@ -338,10 +349,10 @@ int string_decrypt_handler_t::find_decryption_block(mbl_array_t *mba) {
         }
 
         int score = xor_count * 2;
-        if (has_atomic)
+        if ( has_atomic ) 
             score += 10;
 
-        if (score > best_score) {
+        if ( score > best_score ) {
             best_score = score;
             best_block = i;
         }

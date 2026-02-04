@@ -21,7 +21,7 @@ size_t mba_simplify_handler_t::total_simplified_ = 0;
 // Initialization
 //--------------------------------------------------------------------------
 void mba_simplify_handler_t::initialize() {
-    if (initialized_) {
+    if ( initialized_ ) {
         return;
     }
 
@@ -45,12 +45,12 @@ bool mba_simplify_handler_t::is_initialized() {
 // Detection
 //--------------------------------------------------------------------------
 bool mba_simplify_handler_t::detect(mbl_array_t *mba) {
-    if (!mba) {
+    if ( !mba ) {
         return false;
     }
 
     // Ensure initialized
-    if (!initialized_) {
+    if ( !initialized_ ) {
         initialize();
     }
 
@@ -58,34 +58,34 @@ bool mba_simplify_handler_t::detect(mbl_array_t *mba) {
     int complex_count = 0;
     const int THRESHOLD = 3;  // Need at least 3 complex patterns
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk) continue;
+        if ( !blk) continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             // Look for nested operations (sign of obfuscation)
-            if (!is_mba_opcode(ins->opcode)) {
+            if ( !is_mba_opcode(ins->opcode) ) {
                 continue;
             }
 
             // Check if operands contain nested operations
             bool has_nested = false;
 
-            if (ins->l.t == mop_d && ins->l.d) {
-                if (is_mba_opcode(ins->l.d->opcode)) {
+            if ( ins->l.t == mop_d && ins->l.d ) {
+                if ( is_mba_opcode(ins->l.d->opcode) ) {
                     has_nested = true;
                 }
             }
 
-            if (ins->r.t == mop_d && ins->r.d) {
-                if (is_mba_opcode(ins->r.d->opcode)) {
+            if ( ins->r.t == mop_d && ins->r.d ) {
+                if ( is_mba_opcode(ins->r.d->opcode) ) {
                     has_nested = true;
                 }
             }
 
-            if (has_nested) {
+            if ( has_nested ) {
                 complex_count++;
-                if (complex_count >= THRESHOLD) {
+                if ( complex_count >= THRESHOLD ) {
                     return true;
                 }
             }
@@ -99,11 +99,11 @@ bool mba_simplify_handler_t::detect(mbl_array_t *mba) {
 // Main deobfuscation pass
 //--------------------------------------------------------------------------
 int mba_simplify_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
-    if (!mba || !ctx) {
+    if ( !mba || !ctx ) {
         return 0;
     }
 
-    if (!initialized_) {
+    if ( !initialized_ ) {
         initialize();
     }
 
@@ -116,11 +116,11 @@ int mba_simplify_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
         int pass_changes = 0;
         pass++;
 
-        for (int i = 0; i < mba->qty; i++) {
+        for ( int i = 0; i < mba->qty; ++i ) {
             mblock_t *blk = mba->get_mblock(i);
-            if (!blk) continue;
+            if ( !blk) continue;
 
-            for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+            for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
                 int changes = try_simplify_instruction(blk, ins);
                 pass_changes += changes;
             }
@@ -128,16 +128,16 @@ int mba_simplify_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 
         total_changes += pass_changes;
 
-        if (pass_changes > 0) {
+        if ( pass_changes > 0 ) {
             // Verify after changes
             mba->verify(false);
         }
 
-    } while (pass < MAX_PASSES && total_changes > 0 && pass == 1);
+    } while ( pass < MAX_PASSES && total_changes > 0 && pass == 1);
     // Note: For now, only do one pass to avoid potential infinite loops
     // TODO: Improve change detection to safely do multiple passes
 
-    if (total_changes > 0) {
+    if ( total_changes > 0 ) {
         ctx->expressions_simplified += total_changes;
         deobf::log_verbose("[MBA] Simplified %d expressions\n", total_changes);
     }
@@ -150,19 +150,19 @@ int mba_simplify_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 //--------------------------------------------------------------------------
 int mba_simplify_handler_t::simplify_insn(mblock_t *blk, minsn_t *ins, deobf_ctx_t *ctx) {
     // Early null check before anything else
-    if (!blk || !ins) {
+    if ( !blk || !ins ) {
         return 0;
     }
 
     // Only try to simplify if registry is initialized
-    if (!initialized_) {
+    if ( !initialized_ ) {
         // Don't initialize here - do it at plugin init time
         return 0;
     }
 
     int changes = try_simplify_instruction(blk, ins);
 
-    if (changes > 0 && ctx) {
+    if ( changes > 0 && ctx ) {
         ctx->expressions_simplified += changes;
     }
 
@@ -173,18 +173,18 @@ int mba_simplify_handler_t::simplify_insn(mblock_t *blk, minsn_t *ins, deobf_ctx
 // Internal simplification
 //--------------------------------------------------------------------------
 int mba_simplify_handler_t::try_simplify_instruction(mblock_t *blk, minsn_t *ins) {
-    if (!ins || !is_mba_opcode(ins->opcode)) {
+    if ( !ins || !is_mba_opcode(ins->opcode) ) {
         return 0;
     }
 
     // Ensure initialized
-    if (!initialized_) {
+    if ( !initialized_ ) {
         initialize();
     }
 
     // Try to find a matching rule
     auto match = RuleRegistry::instance().find_match(ins);
-    if (!match.rule) {
+    if ( !match.rule ) {
         return 0;
     }
 
@@ -193,15 +193,16 @@ int mba_simplify_handler_t::try_simplify_instruction(mblock_t *blk, minsn_t *ins
 }
 
 int mba_simplify_handler_t::apply_match(mblock_t *blk, minsn_t *ins,
-                                        const RuleRegistry::MatchResult &match) {
-    if (!match.rule) {
+                                        const RuleRegistry::MatchResult &match)
+                                        {
+    if ( !match.rule ) {
         return 0;
     }
 
     // Apply the replacement
     minsn_t *replacement = match.rule->apply_replacement(match.bindings, blk, ins);
 
-    if (!replacement) {
+    if ( !replacement ) {
         return 0;
     }
 
@@ -219,10 +220,10 @@ int mba_simplify_handler_t::apply_match(mblock_t *blk, minsn_t *ins,
     ins->d = orig_dest;
 
     // Ensure operand sizes match destination
-    if (ins->l.size == 0 && orig_dest.size > 0) {
+    if ( ins->l.size == 0 && orig_dest.size > 0 ) {
         ins->l.size = orig_dest.size;
     }
-    if (ins->r.size == 0 && orig_dest.size > 0 && ins->r.t != mop_z) {
+    if ( ins->r.size == 0 && orig_dest.size > 0 && ins->r.t != mop_z ) {
         ins->r.size = orig_dest.size;
     }
 

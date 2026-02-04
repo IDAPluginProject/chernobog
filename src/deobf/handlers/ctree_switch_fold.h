@@ -9,8 +9,8 @@
 // where the state variable (often in high bits via HIDWORD) controls flow.
 //
 // Patterns detected:
-//   1. switch(HIDWORD(x)) where HIDWORD is always a specific constant
-//   2. switch(x >> N) where the shifted bits are always constant
+//   1. switch ( HIDWORD(x )) where HIDWORD is always a specific constant
+//   2. switch ( x >> N ) where the shifted bits are always constant
 //   3. switch on variables that are always assigned the same value
 //
 // This runs after the initial decompilation as a ctree transformation.

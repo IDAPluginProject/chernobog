@@ -11,22 +11,23 @@ size_t jump_optimizer_handler_t::jumps_removed_ = 0;
 // Detection
 //--------------------------------------------------------------------------
 
-bool jump_optimizer_handler_t::detect(mbl_array_t* mba) {
-    if (!mba)
+bool jump_optimizer_handler_t::detect(mbl_array_t* mba)
+{
+    if ( !mba ) 
         return false;
 
     // Look for conditional jumps with complex conditions
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t* blk = mba->get_mblock(i);
-        if (!blk || !blk->tail)
+        if ( !blk || !blk->tail ) 
             continue;
 
         minsn_t* tail = blk->tail;
-        if (!is_mcode_jcond(tail->opcode))
+        if ( !is_mcode_jcond(tail->opcode) ) 
             continue;
 
         // Check if condition is complex (involves nested operations)
-        if (tail->l.t == mop_d && tail->l.d) {
+        if ( tail->l.t == mop_d && tail->l.d ) {
             return true;  // Has nested instruction in condition
         }
     }
@@ -38,8 +39,9 @@ bool jump_optimizer_handler_t::detect(mbl_array_t* mba) {
 // Main pass
 //--------------------------------------------------------------------------
 
-int jump_optimizer_handler_t::run(mbl_array_t* mba, deobf_ctx_t* ctx) {
-    if (!mba || !ctx)
+int jump_optimizer_handler_t::run(mbl_array_t* mba, deobf_ctx_t* ctx)
+{
+    if ( !mba || !ctx ) 
         return 0;
 
     // Initialize rule registry
@@ -47,20 +49,20 @@ int jump_optimizer_handler_t::run(mbl_array_t* mba, deobf_ctx_t* ctx) {
 
     int total_changes = 0;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t* blk = mba->get_mblock(i);
-        if (!blk || !blk->tail)
+        if ( !blk || !blk->tail ) 
             continue;
 
         minsn_t* tail = blk->tail;
-        if (!is_mcode_jcond(tail->opcode))
+        if ( !is_mcode_jcond(tail->opcode) ) 
             continue;
 
         int changes = simplify_jcc(blk, tail, ctx);
         total_changes += changes;
     }
 
-    if (total_changes > 0) {
+    if ( total_changes > 0 ) {
         ctx->branches_simplified += total_changes;
         deobf::log_verbose("[JumpOpt] Simplified %d conditional jumps\n", total_changes);
     }
@@ -73,11 +75,11 @@ int jump_optimizer_handler_t::run(mbl_array_t* mba, deobf_ctx_t* ctx) {
 //--------------------------------------------------------------------------
 
 int jump_optimizer_handler_t::simplify_jcc(mblock_t* blk, minsn_t* jcc, deobf_ctx_t* ctx) {
-    if (!blk || !jcc || !is_mcode_jcond(jcc->opcode))
+    if ( !blk || !jcc || !is_mcode_jcond(jcc->opcode) ) 
         return 0;
 
     int result = rules::JumpRuleRegistry::instance().try_apply(blk, jcc);
-    if (result == -1)
+    if ( result == -1 ) 
         return 0;  // No rule matched
 
     return apply_optimization(blk, jcc, result);
@@ -87,8 +89,9 @@ int jump_optimizer_handler_t::simplify_jcc(mblock_t* blk, minsn_t* jcc, deobf_ct
 // Apply optimization
 //--------------------------------------------------------------------------
 
-int jump_optimizer_handler_t::apply_optimization(mblock_t* blk, minsn_t* jcc, int result) {
-    if (result == 1) {
+int jump_optimizer_handler_t::apply_optimization(mblock_t* blk, minsn_t* jcc, int result)
+{
+    if ( result == 1 ) {
         // Jump is always taken - convert to unconditional goto
         ea_t orig_ea = jcc->ea;
 
@@ -109,7 +112,7 @@ int jump_optimizer_handler_t::apply_optimization(mblock_t* blk, minsn_t* jcc, in
         deobf::log_verbose("[JumpOpt] Converted always-taken jcc at %a to goto\n", orig_ea);
         return 1;
     }
-    else if (result == 0) {
+    else if ( result == 0 ) {
         // Jump is never taken - remove it (becomes fall-through)
         ea_t orig_ea = jcc->ea;
 
@@ -134,7 +137,8 @@ int jump_optimizer_handler_t::apply_optimization(mblock_t* blk, minsn_t* jcc, in
 // Statistics
 //--------------------------------------------------------------------------
 
-void jump_optimizer_handler_t::dump_statistics() {
+void jump_optimizer_handler_t::dump_statistics()
+{
     msg("[chernobog] Jump Optimizer Statistics:\n");
     msg("  Total simplified: %zu\n", jumps_simplified_);
     msg("  Converted to goto: %zu\n", jumps_converted_goto_);
@@ -143,7 +147,8 @@ void jump_optimizer_handler_t::dump_statistics() {
     rules::JumpRuleRegistry::instance().dump_statistics();
 }
 
-void jump_optimizer_handler_t::reset_statistics() {
+void jump_optimizer_handler_t::reset_statistics()
+{
     jumps_simplified_ = 0;
     jumps_converted_goto_ = 0;
     jumps_removed_ = 0;

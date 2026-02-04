@@ -91,14 +91,16 @@ namespace simd {
 
 // Check if pointer is aligned to N bytes
 template<size_t N>
-SIMD_FORCE_INLINE bool is_aligned(const void* ptr) {
+SIMD_FORCE_INLINE bool is_aligned(const void* ptr)
+{
     static_assert((N & (N - 1)) == 0, "N must be power of 2");
     return (reinterpret_cast<uintptr_t>(ptr) & (N - 1)) == 0;
 }
 
 // Align pointer up to N bytes
 template<size_t N>
-SIMD_FORCE_INLINE void* align_up(void* ptr) {
+SIMD_FORCE_INLINE void* align_up(void* ptr)
+{
     static_assert((N & (N - 1)) == 0, "N must be power of 2");
     return reinterpret_cast<void*>(
         (reinterpret_cast<uintptr_t>(ptr) + (N - 1)) & ~(N - 1));
@@ -106,7 +108,8 @@ SIMD_FORCE_INLINE void* align_up(void* ptr) {
 
 // Align pointer down to N bytes
 template<size_t N>
-SIMD_FORCE_INLINE void* align_down(void* ptr) {
+SIMD_FORCE_INLINE void* align_down(void* ptr)
+{
     static_assert((N & (N - 1)) == 0, "N must be power of 2");
     return reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(ptr) & ~(N - 1));
@@ -129,12 +132,13 @@ constexpr size_t SIMD_ALIGNMENT =
 //--------------------------------------------------------------------------
 
 // Compare two memory blocks for equality (optimized for small sizes)
-SIMD_FORCE_INLINE bool mem_eq(const void* a, const void* b, size_t n) {
+SIMD_FORCE_INLINE bool mem_eq(const void* a, const void* b, size_t n)
+{
     const uint8_t* pa = static_cast<const uint8_t*>(a);
     const uint8_t* pb = static_cast<const uint8_t*>(b);
 
     // Fast path for common small sizes
-    switch (n) {
+    switch ( n ) {
         case 0: return true;
         case 1: return *pa == *pb;
         case 2: return *reinterpret_cast<const uint16_t*>(pa) == 
@@ -147,46 +151,46 @@ SIMD_FORCE_INLINE bool mem_eq(const void* a, const void* b, size_t n) {
 
 #if defined(CHERNOBOG_AVX2)
     // AVX2: 32 bytes at a time
-    while (n >= 32) {
+    while ( n >= 32 ) {
         __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pa));
         __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pb));
         __m256i cmp = _mm256_cmpeq_epi8(va, vb);
-        if (_mm256_movemask_epi8(cmp) != -1) return false;
+        if ( _mm256_movemask_epi8(cmp) != -1 ) return false;
         pa += 32; pb += 32; n -= 32;
     }
 #endif
 
 #if defined(CHERNOBOG_SSE2)
     // SSE2: 16 bytes at a time
-    while (n >= 16) {
+    while ( n >= 16 ) {
         __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pa));
         __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pb));
         __m128i cmp = _mm_cmpeq_epi8(va, vb);
-        if (_mm_movemask_epi8(cmp) != 0xFFFF) return false;
+        if ( _mm_movemask_epi8(cmp) != 0xFFFF ) return false;
         pa += 16; pb += 16; n -= 16;
     }
 #elif defined(CHERNOBOG_NEON)
     // NEON: 16 bytes at a time
-    while (n >= 16) {
+    while ( n >= 16 ) {
         uint8x16_t va = vld1q_u8(pa);
         uint8x16_t vb = vld1q_u8(pb);
         uint8x16_t cmp = vceqq_u8(va, vb);
         // Check if all bytes match
         uint64x2_t cmp64 = vreinterpretq_u64_u8(cmp);
-        if (vgetq_lane_u64(cmp64, 0) != ~0ULL || 
-            vgetq_lane_u64(cmp64, 1) != ~0ULL) return false;
+        if ( vgetq_lane_u64(cmp64, 0) != ~0ULL ||
+            vgetq_lane_u64(cmp64, 1) != ~0ULL ) return false;
         pa += 16; pb += 16; n -= 16;
     }
 #endif
 
     // Handle remaining bytes
-    while (n >= 8) {
-        if (*reinterpret_cast<const uint64_t*>(pa) != 
-            *reinterpret_cast<const uint64_t*>(pb)) return false;
+    while ( n >= 8 ) {
+        if ( *reinterpret_cast<const uint64_t*>(pa) !=
+            *reinterpret_cast<const uint64_t*>(pb) ) return false;
         pa += 8; pb += 8; n -= 8;
     }
-    while (n > 0) {
-        if (*pa++ != *pb++) return false;
+    while ( n > 0 ) {
+        if ( *pa++ != *pb++ ) return false;
         --n;
     }
     return true;
@@ -208,12 +212,14 @@ constexpr uint64_t XXH_PRIME64_4 = 0x85EBCA77C2B2AE63ULL;
 constexpr uint64_t XXH_PRIME64_5 = 0x27D4EB2F165667C5ULL;
 
 // Rotate left (portable)
-SIMD_FORCE_INLINE uint64_t rotl64(uint64_t x, int r) {
+SIMD_FORCE_INLINE uint64_t rotl64(uint64_t x, int r)
+{
     return (x << r) | (x >> (64 - r));
 }
 
 // Mix function for hash finalization
-SIMD_FORCE_INLINE uint64_t avalanche64(uint64_t h) {
+SIMD_FORCE_INLINE uint64_t avalanche64(uint64_t h)
+{
     h ^= h >> 33;
     h *= XXH_PRIME64_2;
     h ^= h >> 29;
@@ -223,21 +229,22 @@ SIMD_FORCE_INLINE uint64_t avalanche64(uint64_t h) {
 }
 
 // Fast hash for small data - SIMD accelerated for larger inputs
-SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
+SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len)
+{
     const uint8_t* p = static_cast<const uint8_t*>(data);
     uint64_t h;
 
     // For very small inputs (common case), use simple FNV-1a
-    if (SIMD_LIKELY(len < 32)) {
+    if ( SIMD_LIKELY(len < 32) ) {
         h = FNV_OFFSET_BASIS;
-        while (len >= 8) {
+        while ( len >= 8 ) {
             uint64_t k = *reinterpret_cast<const uint64_t*>(p);
             h ^= k;
             h *= FNV_PRIME;
             p += 8;
             len -= 8;
         }
-        while (len > 0) {
+        while ( len > 0 ) {
             h ^= *p++;
             h *= FNV_PRIME;
             --len;
@@ -247,35 +254,35 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
 
 #if defined(CHERNOBOG_AVX2)
     // AVX2: Process 64 bytes at a time using parallel lanes
-    if (len >= 64) {
+    if ( len >= 64 ) {
         __m256i acc1 = _mm256_set1_epi64x(XXH_PRIME64_1);
         __m256i acc2 = _mm256_set1_epi64x(XXH_PRIME64_2);
         const __m256i prime2 = _mm256_set1_epi64x(XXH_PRIME64_2);
         const __m256i prime3 = _mm256_set1_epi64x(XXH_PRIME64_3);
-        
-        while (len >= 64) {
+
+        while ( len >= 64 ) {
             __m256i data1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
             __m256i data2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
-            
+
             // Mixing step: multiply-accumulate
             acc1 = _mm256_add_epi64(acc1, _mm256_mul_epu32(data1, prime2));
             acc2 = _mm256_add_epi64(acc2, _mm256_mul_epu32(data2, prime2));
-            
+
             // Rotate and mix
             acc1 = _mm256_xor_si256(acc1, _mm256_srli_epi64(data1, 33));
             acc2 = _mm256_xor_si256(acc2, _mm256_srli_epi64(data2, 33));
-            
+
             p += 64;
             len -= 64;
         }
-        
+
         // Combine lanes
         alignas(32) uint64_t lanes[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc1);
         _mm256_store_si256(reinterpret_cast<__m256i*>(lanes + 4), acc2);
-        
+
         h = XXH_PRIME64_5;
-        for (int i = 0; i < 8; i++) {
+        for ( int i = 0; i < 8; ++i ) {
             h ^= rotl64(lanes[i] * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
             h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
         }
@@ -284,35 +291,35 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
     }
 #elif defined(CHERNOBOG_NEON)
     // NEON: Process 32 bytes at a time
-    if (len >= 32) {
+    if ( len >= 32 ) {
         uint64x2_t acc1 = vdupq_n_u64(XXH_PRIME64_1);
         uint64x2_t acc2 = vdupq_n_u64(XXH_PRIME64_2);
-        
-        while (len >= 32) {
+
+        while ( len >= 32 ) {
             uint64x2_t data1 = vld1q_u64(reinterpret_cast<const uint64_t*>(p));
             uint64x2_t data2 = vld1q_u64(reinterpret_cast<const uint64_t*>(p + 16));
-            
+
             // Mixing: add with multiply low 32 bits
             uint32x4_t d1_32 = vreinterpretq_u32_u64(data1);
             uint32x4_t d2_32 = vreinterpretq_u32_u64(data2);
             acc1 = vaddq_u64(acc1, vmull_u32(vget_low_u32(d1_32), vdup_n_u32(XXH_PRIME64_2 & 0xFFFFFFFF)));
             acc2 = vaddq_u64(acc2, vmull_u32(vget_low_u32(d2_32), vdup_n_u32(XXH_PRIME64_2 & 0xFFFFFFFF)));
-            
+
             // XOR with shifted data
             acc1 = veorq_u64(acc1, vshrq_n_u64(data1, 33));
             acc2 = veorq_u64(acc2, vshrq_n_u64(data2, 33));
-            
+
             p += 32;
             len -= 32;
         }
-        
+
         // Combine lanes
         uint64_t lanes[4];
         vst1q_u64(lanes, acc1);
         vst1q_u64(lanes + 2, acc2);
-        
+
         h = XXH_PRIME64_5;
-        for (int i = 0; i < 4; i++) {
+        for ( int i = 0; i < 4; ++i ) {
             h ^= rotl64(lanes[i] * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
             h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
         }
@@ -325,12 +332,12 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
 
     // Process remaining 32-byte chunks (scalar)
     h += len;
-    while (len >= 32) {
+    while ( len >= 32 ) {
         uint64_t k1 = *reinterpret_cast<const uint64_t*>(p);
         uint64_t k2 = *reinterpret_cast<const uint64_t*>(p + 8);
         uint64_t k3 = *reinterpret_cast<const uint64_t*>(p + 16);
         uint64_t k4 = *reinterpret_cast<const uint64_t*>(p + 24);
-        
+
         h ^= rotl64(k1 * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
         h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
         h ^= rotl64(k2 * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
@@ -339,13 +346,13 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
         h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
         h ^= rotl64(k4 * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
         h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
-        
+
         p += 32;
         len -= 32;
     }
 
     // Process remaining 8-byte chunks
-    while (len >= 8) {
+    while ( len >= 8 ) {
         uint64_t k = *reinterpret_cast<const uint64_t*>(p);
         h ^= rotl64(k * XXH_PRIME64_2, 31) * XXH_PRIME64_1;
         h = rotl64(h, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
@@ -354,7 +361,7 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
     }
 
     // Process remaining 4-byte chunk
-    if (len >= 4) {
+    if ( len >= 4 ) {
         h ^= static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(p)) * XXH_PRIME64_1;
         h = rotl64(h, 23) * XXH_PRIME64_2 + XXH_PRIME64_3;
         p += 4;
@@ -362,7 +369,7 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
     }
 
     // Process remaining bytes
-    while (len > 0) {
+    while ( len > 0 ) {
         h ^= static_cast<uint64_t>(*p++) * XXH_PRIME64_5;
         h = rotl64(h, 11) * XXH_PRIME64_1;
         --len;
@@ -372,14 +379,16 @@ SIMD_FORCE_INLINE uint64_t hash_bytes(const void* data, size_t len) {
 }
 
 // Fast hash combine (for composite keys)
-SIMD_FORCE_INLINE uint64_t hash_combine(uint64_t h1, uint64_t h2) {
+SIMD_FORCE_INLINE uint64_t hash_combine(uint64_t h1, uint64_t h2)
+{
     // Mix bits thoroughly
     h1 ^= h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2);
     return h1;
 }
 
 // Fast integer hash
-SIMD_FORCE_INLINE uint64_t hash_u64(uint64_t x) {
+SIMD_FORCE_INLINE uint64_t hash_u64(uint64_t x)
+{
     // Murmur3-like finalizer
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
@@ -389,7 +398,8 @@ SIMD_FORCE_INLINE uint64_t hash_u64(uint64_t x) {
     return x;
 }
 
-SIMD_FORCE_INLINE uint32_t hash_u32(uint32_t x) {
+SIMD_FORCE_INLINE uint32_t hash_u32(uint32_t x)
+{
     // Murmur3 finalizer
     x ^= x >> 16;
     x *= 0x85ebca6b;
@@ -403,7 +413,8 @@ SIMD_FORCE_INLINE uint32_t hash_u32(uint32_t x) {
 // Portable popcount / bit operations
 //--------------------------------------------------------------------------
 
-SIMD_FORCE_INLINE int popcount32(uint32_t x) {
+SIMD_FORCE_INLINE int popcount32(uint32_t x)
+{
 #if defined(_MSC_VER)
     return __popcnt(x);
 #else
@@ -411,7 +422,8 @@ SIMD_FORCE_INLINE int popcount32(uint32_t x) {
 #endif
 }
 
-SIMD_FORCE_INLINE int popcount64(uint64_t x) {
+SIMD_FORCE_INLINE int popcount64(uint64_t x)
+{
 #if defined(_MSC_VER)
     #if defined(_M_X64)
         return (int)__popcnt64(x);
@@ -423,8 +435,9 @@ SIMD_FORCE_INLINE int popcount64(uint64_t x) {
 #endif
 }
 
-SIMD_FORCE_INLINE int clz32(uint32_t x) {
-    if (x == 0) return 32;
+SIMD_FORCE_INLINE int clz32(uint32_t x)
+{
+    if ( x == 0 ) return 32;
 #if defined(_MSC_VER)
     unsigned long idx;
     _BitScanReverse(&idx, x);
@@ -434,8 +447,9 @@ SIMD_FORCE_INLINE int clz32(uint32_t x) {
 #endif
 }
 
-SIMD_FORCE_INLINE int clz64(uint64_t x) {
-    if (x == 0) return 64;
+SIMD_FORCE_INLINE int clz64(uint64_t x)
+{
+    if ( x == 0 ) return 64;
 #if defined(_MSC_VER)
     #if defined(_M_X64)
         unsigned long idx;
@@ -443,7 +457,7 @@ SIMD_FORCE_INLINE int clz64(uint64_t x) {
         return 63 - (int)idx;
     #else
         uint32_t hi = (uint32_t)(x >> 32);
-        if (hi != 0) {
+        if ( hi != 0 ) {
             unsigned long idx;
             _BitScanReverse(&idx, hi);
             return 31 - (int)idx;
@@ -457,8 +471,9 @@ SIMD_FORCE_INLINE int clz64(uint64_t x) {
 #endif
 }
 
-SIMD_FORCE_INLINE int ctz32(uint32_t x) {
-    if (x == 0) return 32;
+SIMD_FORCE_INLINE int ctz32(uint32_t x)
+{
+    if ( x == 0 ) return 32;
 #if defined(_MSC_VER)
     unsigned long idx;
     _BitScanForward(&idx, x);
@@ -468,8 +483,9 @@ SIMD_FORCE_INLINE int ctz32(uint32_t x) {
 #endif
 }
 
-SIMD_FORCE_INLINE int ctz64(uint64_t x) {
-    if (x == 0) return 64;
+SIMD_FORCE_INLINE int ctz64(uint64_t x)
+{
+    if ( x == 0 ) return 64;
 #if defined(_MSC_VER)
     #if defined(_M_X64)
         unsigned long idx;
@@ -477,7 +493,7 @@ SIMD_FORCE_INLINE int ctz64(uint64_t x) {
         return (int)idx;
     #else
         uint32_t lo = (uint32_t)x;
-        if (lo != 0) {
+        if ( lo != 0 ) {
             unsigned long idx;
             _BitScanForward(&idx, lo);
             return (int)idx;
@@ -492,30 +508,35 @@ SIMD_FORCE_INLINE int ctz64(uint64_t x) {
 }
 
 // Log2 floor (for power-of-2 calculations)
-SIMD_FORCE_INLINE int log2_floor(uint64_t x) {
-    if (x == 0) return -1;
+SIMD_FORCE_INLINE int log2_floor(uint64_t x)
+{
+    if ( x == 0 ) return -1;
     return 63 - clz64(x);
 }
 
-SIMD_FORCE_INLINE int log2_floor32(uint32_t x) {
-    if (x == 0) return -1;
+SIMD_FORCE_INLINE int log2_floor32(uint32_t x)
+{
+    if ( x == 0 ) return -1;
     return 31 - clz32(x);
 }
 
 // Log2 ceiling (rounds up)
-SIMD_FORCE_INLINE int log2_ceil(uint64_t x) {
-    if (x <= 1) return 0;
+SIMD_FORCE_INLINE int log2_ceil(uint64_t x)
+{
+    if ( x <= 1 ) return 0;
     return 64 - clz64(x - 1);
 }
 
 // Next power of 2 (for capacity calculations)
-SIMD_FORCE_INLINE uint64_t next_pow2(uint64_t x) {
-    if (x == 0) return 1;
+SIMD_FORCE_INLINE uint64_t next_pow2(uint64_t x)
+{
+    if ( x == 0 ) return 1;
     return 1ULL << log2_ceil(x);
 }
 
-SIMD_FORCE_INLINE uint32_t next_pow2_32(uint32_t x) {
-    if (x == 0) return 1;
+SIMD_FORCE_INLINE uint32_t next_pow2_32(uint32_t x)
+{
+    if ( x == 0 ) return 1;
     x--;
     x |= x >> 1;
     x |= x >> 2;
@@ -526,7 +547,8 @@ SIMD_FORCE_INLINE uint32_t next_pow2_32(uint32_t x) {
 }
 
 // Check if value is power of 2
-SIMD_FORCE_INLINE bool is_pow2(uint64_t x) {
+SIMD_FORCE_INLINE bool is_pow2(uint64_t x)
+{
     return x != 0 && (x & (x - 1)) == 0;
 }
 
@@ -546,7 +568,8 @@ struct alignas(16) PatternSignature {
     uint16_t leaf_count;     // Total number of leaves  
     uint16_t _pad;
     
-    SIMD_FORCE_INLINE bool operator==(const PatternSignature& other) const {
+    SIMD_FORCE_INLINE bool operator==(const PatternSignature& other) const
+    {
         // Fast SIMD compare for aligned structures
 #if defined(CHERNOBOG_SSE2)
         __m128i a = _mm_load_si128(reinterpret_cast<const __m128i*>(this));
@@ -560,9 +583,9 @@ struct alignas(16) PatternSignature {
         uint64x2_t cmp64 = vreinterpretq_u64_u8(cmp);
         return vgetq_lane_u64(cmp64, 0) == ~0ULL && vgetq_lane_u64(cmp64, 1) == ~0ULL;
 #else
-        return opcode_bits == other.opcode_bits && 
+        return opcode_bits == other.opcode_bits &&
                structure_bits == other.structure_bits &&
-               depth == other.depth && 
+               depth == other.depth &&
                node_count == other.node_count &&
                leaf_count == other.leaf_count;
 #endif
@@ -570,19 +593,20 @@ struct alignas(16) PatternSignature {
     
     // Check if this signature could match (allowing wildcards in pattern)
     // Pattern wildcards are encoded as all-1s in relevant bit positions
-    SIMD_FORCE_INLINE bool compatible_with(const PatternSignature& pattern) const {
+    SIMD_FORCE_INLINE bool compatible_with(const PatternSignature& pattern) const
+    {
         // Structure must be identical
-        if (structure_bits != pattern.structure_bits) return false;
-        if (depth != pattern.depth) return false;
-        
+        if ( structure_bits != pattern.structure_bits ) return false;
+        if ( depth != pattern.depth ) return false;
+
         // For opcodes, pattern can have wildcards (0x1F = any)
         uint64_t diff = opcode_bits ^ pattern.opcode_bits;
         // Mask out positions that are wildcards in pattern (0x1F = 31)
         // Check each 5-bit group for wildcard
         uint64_t wildcard_mask = 0;
         uint64_t p = pattern.opcode_bits;
-        for (int i = 0; i < 12; i++) {
-            if ((p & 0x1F) == 0x1F) {
+        for ( int i = 0; i < 12; ++i ) {
+            if ( (p & 0x1F) == 0x1F ) {
                 wildcard_mask |= (0x1FULL << (i * 5));
             }
             p >>= 5;
@@ -594,7 +618,8 @@ struct alignas(16) PatternSignature {
 //--------------------------------------------------------------------------
 // Fast SIMD memset (for clearing structures)
 //--------------------------------------------------------------------------
-SIMD_FORCE_INLINE void memset_zero_16(void* dst) {
+SIMD_FORCE_INLINE void memset_zero_16(void* dst)
+{
 #if defined(CHERNOBOG_SSE2)
     _mm_store_si128(reinterpret_cast<__m128i*>(dst), _mm_setzero_si128());
 #elif defined(CHERNOBOG_NEON)
@@ -604,7 +629,8 @@ SIMD_FORCE_INLINE void memset_zero_16(void* dst) {
 #endif
 }
 
-SIMD_FORCE_INLINE void memset_zero_32(void* dst) {
+SIMD_FORCE_INLINE void memset_zero_32(void* dst)
+{
 #if defined(CHERNOBOG_AVX2)
     _mm256_store_si256(reinterpret_cast<__m256i*>(dst), _mm256_setzero_si256());
 #elif defined(CHERNOBOG_SSE2)
@@ -620,7 +646,8 @@ SIMD_FORCE_INLINE void memset_zero_32(void* dst) {
 #endif
 }
 
-SIMD_FORCE_INLINE void memset_zero_64(void* dst) {
+SIMD_FORCE_INLINE void memset_zero_64(void* dst)
+{
 #if defined(CHERNOBOG_AVX2)
     __m256i zero = _mm256_setzero_si256();
     _mm256_store_si256(reinterpret_cast<__m256i*>(dst), zero);
@@ -645,19 +672,21 @@ SIMD_FORCE_INLINE void memset_zero_64(void* dst) {
 //--------------------------------------------------------------------------
 // SIMD-accelerated memcpy for aligned structures
 //--------------------------------------------------------------------------
-SIMD_FORCE_INLINE void memcpy_16(void* dst, const void* src) {
+SIMD_FORCE_INLINE void memcpy_16(void* dst, const void* src)
+{
 #if defined(CHERNOBOG_SSE2)
-    _mm_store_si128(reinterpret_cast<__m128i*>(dst), 
+    _mm_store_si128(reinterpret_cast<__m128i*>(dst),
                     _mm_load_si128(reinterpret_cast<const __m128i*>(src)));
 #elif defined(CHERNOBOG_NEON)
-    vst1q_u8(reinterpret_cast<uint8_t*>(dst), 
+    vst1q_u8(reinterpret_cast<uint8_t*>(dst),
              vld1q_u8(reinterpret_cast<const uint8_t*>(src)));
 #else
     memcpy(dst, src, 16);
 #endif
 }
 
-SIMD_FORCE_INLINE void memcpy_32(void* dst, const void* src) {
+SIMD_FORCE_INLINE void memcpy_32(void* dst, const void* src)
+{
 #if defined(CHERNOBOG_AVX2)
     _mm256_store_si256(reinterpret_cast<__m256i*>(dst),
                        _mm256_load_si256(reinterpret_cast<const __m256i*>(src)));
@@ -687,26 +716,29 @@ class SmallVector {
 public:
     SmallVector() : size_(0), capacity_(InlineCapacity), data_(inline_storage()) {}
     
-    ~SmallVector() {
+    ~SmallVector()
+    {
         clear();
-        if (data_ != inline_storage()) {
+        if ( data_ != inline_storage() ) {
             ::operator delete(data_);
         }
     }
     
-    SmallVector(const SmallVector& other) : size_(0), capacity_(InlineCapacity), data_(inline_storage()) {
+    SmallVector(const SmallVector& other) : size_(0), capacity_(InlineCapacity), data_(inline_storage())
+    {
         reserve(other.size_);
-        for (size_t i = 0; i < other.size_; ++i) {
+        for ( size_t i = 0; i < other.size_; ++i ) {
             new (&data_[i]) T(other.data_[i]);
         }
         size_ = other.size_;
     }
     
-    SmallVector& operator=(const SmallVector& other) {
-        if (this != &other) {
+    SmallVector& operator=(const SmallVector& other)
+    {
+        if ( this != &other ) {
             clear();
             reserve(other.size_);
-            for (size_t i = 0; i < other.size_; ++i) {
+            for ( size_t i = 0; i < other.size_; ++i ) {
                 new (&data_[i]) T(other.data_[i]);
             }
             size_ = other.size_;
@@ -714,10 +746,11 @@ public:
         return *this;
     }
     
-    SmallVector(SmallVector&& other) noexcept : size_(0), capacity_(InlineCapacity), data_(inline_storage()) {
-        if (other.data_ == other.inline_storage()) {
+    SmallVector(SmallVector&& other) noexcept : size_(0), capacity_(InlineCapacity), data_(inline_storage())
+    {
+        if ( other.data_ == other.inline_storage() ) {
             // Move elements from inline storage
-            for (size_t i = 0; i < other.size_; ++i) {
+            for ( size_t i = 0; i < other.size_; ++i ) {
                 new (&data_[i]) T(std::move(other.data_[i]));
                 other.data_[i].~T();
             }
@@ -734,16 +767,18 @@ public:
         }
     }
     
-    void push_back(const T& val) {
-        if (size_ >= capacity_) {
+    void push_back(const T& val)
+    {
+        if ( size_ >= capacity_ ) {
             grow(capacity_ * 2);
         }
         new (&data_[size_]) T(val);
         ++size_;
     }
     
-    void push_back(T&& val) {
-        if (size_ >= capacity_) {
+    void push_back(T&& val)
+    {
+        if ( size_ >= capacity_ ) {
             grow(capacity_ * 2);
         }
         new (&data_[size_]) T(std::move(val));
@@ -751,41 +786,46 @@ public:
     }
     
     template<typename... Args>
-    T& emplace_back(Args&&... args) {
-        if (size_ >= capacity_) {
+    T& emplace_back(Args&&... args)
+    {
+        if ( size_ >= capacity_ ) {
             grow(capacity_ * 2);
         }
         new (&data_[size_]) T(std::forward<Args>(args)...);
         return data_[size_++];
     }
     
-    void pop_back() {
-        if (size_ > 0) {
+    void pop_back()
+    {
+        if ( size_ > 0 ) {
             data_[--size_].~T();
         }
     }
     
-    void clear() {
-        for (size_t i = 0; i < size_; ++i) {
+    void clear()
+    {
+        for ( size_t i = 0; i < size_; ++i ) {
             data_[i].~T();
         }
         size_ = 0;
     }
     
-    void reserve(size_t n) {
-        if (n > capacity_) {
+    void reserve(size_t n)
+    {
+        if ( n > capacity_ ) {
             grow(n);
         }
     }
     
-    void resize(size_t n) {
-        if (n > size_) {
+    void resize(size_t n)
+    {
+        if ( n > size_ ) {
             reserve(n);
-            for (size_t i = size_; i < n; ++i) {
+            for ( size_t i = size_; i < n; ++i ) {
                 new (&data_[i]) T();
             }
         } else {
-            for (size_t i = n; i < size_; ++i) {
+            for ( size_t i = n; i < size_; ++i ) {
                 data_[i].~T();
             }
         }
@@ -813,25 +853,28 @@ public:
     const T& back() const { return data_[size_ - 1]; }
     
 private:
-    T* inline_storage() { 
-        return reinterpret_cast<T*>(&storage_); 
+    T* inline_storage()
+    {
+        return reinterpret_cast<T*>(&storage_);
     }
-    const T* inline_storage() const { 
-        return reinterpret_cast<const T*>(&storage_); 
+    const T* inline_storage() const
+    {
+        return reinterpret_cast<const T*>(&storage_);
     }
     
-    void grow(size_t new_cap) {
+    void grow(size_t new_cap)
+    {
         T* new_data = static_cast<T*>(::operator new(new_cap * sizeof(T)));
-        
-        for (size_t i = 0; i < size_; ++i) {
+
+        for ( size_t i = 0; i < size_; ++i ) {
             new (&new_data[i]) T(std::move(data_[i]));
             data_[i].~T();
         }
-        
-        if (data_ != inline_storage()) {
+
+        if ( data_ != inline_storage() ) {
             ::operator delete(data_);
         }
-        
+
         data_ = new_data;
         capacity_ = new_cap;
     }
@@ -850,11 +893,12 @@ class Arena {
 public:
     static constexpr size_t DEFAULT_BLOCK_SIZE = 4096;
     
-    explicit Arena(size_t block_size = DEFAULT_BLOCK_SIZE) 
+    explicit Arena(size_t block_size = DEFAULT_BLOCK_SIZE)
         : block_size_(block_size), current_(nullptr), end_(nullptr) {}
     
-    ~Arena() {
-        for (void* block : blocks_) {
+    ~Arena()
+    {
+        for ( void* block : blocks_ ) {
             ::operator delete(block);
         }
     }
@@ -863,37 +907,40 @@ public:
     Arena(const Arena&) = delete;
     Arena& operator=(const Arena&) = delete;
     
-    void* allocate(size_t size, size_t align = 8) {
+    void* allocate(size_t size, size_t align = 8)
+    {
         // Align current pointer
         uintptr_t aligned = (reinterpret_cast<uintptr_t>(current_) + align - 1) & ~(align - 1);
         char* result = reinterpret_cast<char*>(aligned);
-        
-        if (result + size > end_) {
+
+        if ( result + size > end_ ) {
             // Need new block
             size_t alloc_size = std::max(block_size_, size + align);
             char* new_block = static_cast<char*>(::operator new(alloc_size));
             blocks_.push_back(new_block);
             current_ = new_block;
             end_ = new_block + alloc_size;
-            
+
             aligned = (reinterpret_cast<uintptr_t>(current_) + align - 1) & ~(align - 1);
             result = reinterpret_cast<char*>(aligned);
         }
-        
+
         current_ = result + size;
         return result;
     }
     
     template<typename T, typename... Args>
-    T* create(Args&&... args) {
+    T* create(Args&&... args)
+    {
         void* mem = allocate(sizeof(T), alignof(T));
         return new (mem) T(std::forward<Args>(args)...);
     }
     
-    void reset() {
+    void reset()
+    {
         // Keep first block, release rest
-        if (!blocks_.empty()) {
-            for (size_t i = 1; i < blocks_.size(); ++i) {
+        if ( !blocks_.empty() ) {
+            for ( size_t i = 1; i < blocks_.size(); ++i ) {
                 ::operator delete(blocks_[i]);
             }
             current_ = static_cast<char*>(blocks_[0]);
@@ -902,10 +949,11 @@ public:
         }
     }
     
-    size_t bytes_allocated() const {
+    size_t bytes_allocated() const
+    {
         size_t total = 0;
-        for (size_t i = 0; i < blocks_.size(); ++i) {
-            total += (i == blocks_.size() - 1) 
+        for ( size_t i = 0; i < blocks_.size(); ++i ) {
+            total += (i == blocks_.size() - 1)
                 ? static_cast<size_t>(current_ - static_cast<char*>(blocks_[i]))
                 : block_size_;
         }
@@ -928,48 +976,54 @@ public:
     using StringId = uint32_t;
     static constexpr StringId INVALID_ID = ~0u;
     
-    static StringInterner& instance() {
+    static StringInterner& instance()
+    {
         static StringInterner inst;
         return inst;
     }
     
-    StringId intern(const char* str, size_t len) {
+    StringId intern(const char* str, size_t len)
+    {
         uint64_t h = hash_bytes(str, len);
-        
+
         // Check if already interned
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].hash == h && 
+        for ( size_t i = 0; i < entries_.size(); ++i ) {
+            if ( entries_[i].hash == h &&
                 entries_[i].len == len &&
-                memcmp(entries_[i].str, str, len) == 0) {
+                memcmp(entries_[i].str, str, len) == 0 ) {
                 return static_cast<StringId>(i);
             }
         }
-        
+
         // Add new entry
         char* copy = static_cast<char*>(arena_.allocate(len + 1));
         memcpy(copy, str, len);
         copy[len] = '\0';
-        
+
         StringId id = static_cast<StringId>(entries_.size());
         entries_.push_back({h, copy, len});
         return id;
     }
     
-    StringId intern(const std::string& str) {
+    StringId intern(const std::string& str)
+    {
         return intern(str.c_str(), str.size());
     }
     
-    const char* get(StringId id) const {
-        if (id >= entries_.size()) return nullptr;
+    const char* get(StringId id) const
+    {
+        if ( id >= entries_.size() ) return nullptr;
         return entries_[id].str;
     }
     
-    size_t length(StringId id) const {
-        if (id >= entries_.size()) return 0;
+    size_t length(StringId id) const
+    {
+        if ( id >= entries_.size() ) return 0;
         return entries_[id].len;
     }
     
-    void clear() {
+    void clear()
+    {
         entries_.clear();
         arena_.reset();
     }
@@ -997,7 +1051,8 @@ class ObjectPool {
 public:
     ObjectPool() = default;
     
-    ~ObjectPool() {
+    ~ObjectPool()
+    {
         clear();
     }
     
@@ -1006,35 +1061,38 @@ public:
     ObjectPool& operator=(const ObjectPool&) = delete;
     
     template<typename... Args>
-    T* allocate(Args&&... args) {
+    T* allocate(Args&&... args)
+    {
         T* obj;
-        
+
         // Try free list first
-        if (!free_list_.empty()) {
+        if ( !free_list_.empty() ) {
             obj = free_list_.back();
             free_list_.pop_back();
             new (obj) T(std::forward<Args>(args)...);
         } else {
             // Allocate new block if needed
-            if (current_idx_ >= BlockSize || blocks_.empty()) {
+            if ( current_idx_ >= BlockSize || blocks_.empty() ) {
                 allocate_block();
             }
             obj = &blocks_.back()[current_idx_++];
             new (obj) T(std::forward<Args>(args)...);
         }
-        
+
         return obj;
     }
     
-    void deallocate(T* obj) {
-        if (obj) {
+    void deallocate(T* obj)
+    {
+        if ( obj ) {
             obj->~T();
             free_list_.push_back(obj);
         }
     }
     
-    void clear() {
-        for (T* block : blocks_) {
+    void clear()
+    {
+        for ( T* block : blocks_ ) {
             ::operator delete(block);
         }
         blocks_.clear();
@@ -1042,13 +1100,15 @@ public:
         current_idx_ = BlockSize;
     }
     
-    size_t allocated_count() const {
-        if (blocks_.empty()) return 0;
+    size_t allocated_count() const
+    {
+        if ( blocks_.empty() ) return 0;
         return (blocks_.size() - 1) * BlockSize + current_idx_;
     }
     
 private:
-    void allocate_block() {
+    void allocate_block()
+    {
         T* block = static_cast<T*>(::operator new(BlockSize * sizeof(T)));
         blocks_.push_back(block);
         current_idx_ = 0;
@@ -1066,20 +1126,23 @@ private:
 
 class ScopedArena {
 public:
-    explicit ScopedArena(Arena& arena) 
+    explicit ScopedArena(Arena& arena)
         : arena_(arena), saved_bytes_(arena.bytes_allocated()) {}
     
-    ~ScopedArena() {
+    ~ScopedArena()
+    {
         // Note: Arena doesn't support partial deallocation
         // This is more of a marker for debugging/profiling
     }
     
     template<typename T, typename... Args>
-    T* create(Args&&... args) {
+    T* create(Args&&... args)
+    {
         return arena_.create<T>(std::forward<Args>(args)...);
     }
     
-    void* allocate(size_t size, size_t align = 8) {
+    void* allocate(size_t size, size_t align = 8)
+    {
         return arena_.allocate(size, align);
     }
     

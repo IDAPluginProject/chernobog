@@ -46,8 +46,14 @@ public:
     virtual int apply(minsn_t* ins) = 0;
 
     // Statistics
-    size_t hit_count() const { return hit_count_; }
-    void increment_hit_count() { hit_count_++; }
+    size_t hit_count() const
+    {
+        return hit_count_;
+    }
+    void increment_hit_count()
+    {
+        ++hit_count_;
+    }
 
 protected:
     size_t hit_count_ = 0;

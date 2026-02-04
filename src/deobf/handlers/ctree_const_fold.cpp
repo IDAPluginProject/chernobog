@@ -11,15 +11,15 @@ struct const_fold_visitor_t : public ctree_visitor_t {
 
     int idaapi visit_expr(cexpr_t *e) override {
         // Look for XOR expressions
-        if (e->op != cot_xor)
+        if ( e->op != cot_xor ) 
             return 0;
 
         // Need both operands
-        if (!e->x || !e->y)
+        if ( !e->x || !e->y ) 
             return 0;
 
         // One operand must be a number constant
-        if (e->x->op != cot_num && e->y->op != cot_num)
+        if ( e->x->op != cot_num && e->y->op != cot_num ) 
             return 0;
 
         cexpr_t *val_expr = (e->y->op == cot_num) ? e->x : e->y;
@@ -29,45 +29,45 @@ struct const_fold_visitor_t : public ctree_visitor_t {
         ea_t obj_addr = BADADDR;
 
         // Case 1: Direct object reference (cot_obj)
-        if (val_expr->op == cot_obj) {
+        if ( val_expr->op == cot_obj ) {
             obj_addr = val_expr->obj_ea;
         }
         // Case 2: Pointer dereference (cot_ptr) - check if dereferencing a constant
-        else if (val_expr->op == cot_ptr && val_expr->x) {
-            if (val_expr->x->op == cot_obj) {
+        else if ( val_expr->op == cot_ptr && val_expr->x ) {
+            if ( val_expr->x->op == cot_obj ) {
                 obj_addr = val_expr->x->obj_ea;
-            } else if (val_expr->x->op == cot_num) {
+            } else if ( val_expr->x->op == cot_num ) {
                 obj_addr = (ea_t)val_expr->x->numval();
-            } else if (val_expr->x->op == cot_cast && val_expr->x->x) {
+            } else if ( val_expr->x->op == cot_cast && val_expr->x->x ) {
                 // Cast of number or obj
-                if (val_expr->x->x->op == cot_num) {
+                if ( val_expr->x->x->op == cot_num ) {
                     obj_addr = (ea_t)val_expr->x->x->numval();
-                } else if (val_expr->x->x->op == cot_obj) {
+                } else if ( val_expr->x->x->op == cot_obj ) {
                     obj_addr = val_expr->x->x->obj_ea;
                 }
             }
         }
 
-        if (obj_addr == BADADDR)
+        if ( obj_addr == BADADDR ) 
             return 0;
 
         // Check if the address is in a valid segment
         segment_t *seg = getseg(obj_addr);
-        if (!seg)
+        if ( !seg ) 
             return 0;
 
         // Check if it's a data location
         flags64_t flags = get_flags(obj_addr);
-        if (!is_loaded(obj_addr))
+        if ( !is_loaded(obj_addr) ) 
             return 0;
 
         // Read the value based on size
         uint64_t obj_val = 0;
         int size = val_expr->type.get_size();
-        if (size <= 0 || size > 8)
+        if ( size <= 0 || size > 8 ) 
             return 0;
 
-        switch (size) {
+        switch ( size ) {
             case 1: obj_val = get_byte(obj_addr); break;
             case 2: obj_val = get_word(obj_addr); break;
             case 4: obj_val = get_dword(obj_addr); break;
@@ -111,8 +111,9 @@ struct const_fold_visitor_t : public ctree_visitor_t {
 //--------------------------------------------------------------------------
 // Main entry point
 //--------------------------------------------------------------------------
-int ctree_const_fold_handler_t::run(cfunc_t *cfunc) {
-    if (!cfunc)
+int ctree_const_fold_handler_t::run(cfunc_t *cfunc)
+{
+    if ( !cfunc ) 
         return 0;
 
     deobf::log_verbose("[ctree_const_fold] Running on %a\n", cfunc->entry_ea);
@@ -120,7 +121,7 @@ int ctree_const_fold_handler_t::run(cfunc_t *cfunc) {
     const_fold_visitor_t visitor(cfunc);
     visitor.apply_to(&cfunc->body, nullptr);
 
-    if (visitor.changes > 0) {
+    if ( visitor.changes > 0 ) {
         deobf::log("[ctree_const_fold] Folded %d constants\n", visitor.changes);
     }
 

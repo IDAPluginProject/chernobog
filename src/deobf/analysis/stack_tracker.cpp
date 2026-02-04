@@ -58,49 +58,49 @@ void stack_tracker_t::track_write_string(sval_t offset, const char *str) {
 // Read from stack
 //--------------------------------------------------------------------------
 std::optional<uint64_t> stack_tracker_t::read_value(sval_t offset, int size) {
-    auto it = s_slots.find(offset);
-    if (it != s_slots.end() && it->second.has_value) {
-        return it->second.value;
+    auto p = s_slots.find(offset);
+    if ( p != s_slots.end() && p->second.has_value ) {
+        return p->second.value;
     }
     return std::nullopt;
 }
 
 std::optional<ea_t> stack_tracker_t::read_address(sval_t offset) {
-    auto it = s_slots.find(offset);
-    if (it != s_slots.end() && it->second.has_value) {
-        if (it->second.is_address) {
-            return it->second.address;
+    auto p = s_slots.find(offset);
+    if ( p != s_slots.end() && p->second.has_value ) {
+        if ( p->second.is_address ) {
+            return p->second.address;
         }
-        return (ea_t)it->second.value;
+        return (ea_t)p->second.value;
     }
     return std::nullopt;
 }
 
 std::optional<std::string> stack_tracker_t::read_string(sval_t offset) {
-    auto it = s_slots.find(offset);
-    if (it != s_slots.end() && it->second.is_string) {
-        return it->second.string_val;
+    auto p = s_slots.find(offset);
+    if ( p != s_slots.end() && p->second.is_string ) {
+        return p->second.string_val;
     }
     return std::nullopt;
 }
 
 bool stack_tracker_t::is_known(sval_t offset) {
-    auto it = s_slots.find(offset);
-    return it != s_slots.end() && it->second.has_value;
+    auto p = s_slots.find(offset);
+    return p != s_slots.end() && p->second.has_value;
 }
 
 //--------------------------------------------------------------------------
 // Resolve indirect call through stack
 //--------------------------------------------------------------------------
 ea_t stack_tracker_t::resolve_stack_call(minsn_t *call_insn, mbl_array_t *mba) {
-    if (!call_insn)
+    if ( !call_insn )
         return BADADDR;
 
     // Check if the call target is through a stack slot
     // Pattern: icall/call where target is loaded from stack
 
     // For icall, the target is in l operand
-    if (call_insn->opcode == m_icall) {
+    if ( call_insn->opcode == m_icall ) {
         // Check if target comes from stack
         if (call_insn->l.t == mop_S) {
             sval_t offset = call_insn->l.s ? call_insn->l.s->off : 0;

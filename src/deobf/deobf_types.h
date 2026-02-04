@@ -111,12 +111,14 @@ struct deobf_ctx_t {
     int z3_consts_recovered;      // Constants recovered via Z3
     int peephole_opts;            // Peephole optimizations applied
 
-    deobf_ctx_t() : mba(nullptr), cfunc(nullptr), func_ea(BADADDR),
-                   detected_obf(OBF_NONE), switch_var(nullptr), switch_block(-1),
-                   blocks_merged(0), branches_simplified(0), strings_decrypted(0),
-                   consts_decrypted(0), expressions_simplified(0), indirect_resolved(0),
-                   mba_simplified(0), chains_simplified(0), opaque_jumps_resolved(0),
-                   z3_consts_recovered(0), peephole_opts(0) {}
+    deobf_ctx_t()
+        : mba(nullptr), cfunc(nullptr), func_ea(BADADDR),
+          detected_obf(OBF_NONE), switch_var(nullptr), switch_block(-1),
+          blocks_merged(0), branches_simplified(0), strings_decrypted(0),
+          consts_decrypted(0), expressions_simplified(0), indirect_resolved(0),
+          mba_simplified(0), chains_simplified(0), opaque_jumps_resolved(0),
+          z3_consts_recovered(0), peephole_opts(0)
+    {}
 };
 
 //--------------------------------------------------------------------------
@@ -151,7 +153,8 @@ struct sym_expr_t {
 
     sym_expr_t() : op(OP_UNKNOWN), const_val(0), var_idx(-1), bit_size(64) {}
 
-    static std::shared_ptr<sym_expr_t> make_const(uint64_t val, int bits = 64) {
+    static std::shared_ptr<sym_expr_t> make_const(uint64_t val, int bits = 64)
+    {
         auto e = std::make_shared<sym_expr_t>();
         e->op = OP_CONST;
         e->const_val = val;
@@ -159,7 +162,8 @@ struct sym_expr_t {
         return e;
     }
 
-    static std::shared_ptr<sym_expr_t> make_var(int idx, int bits = 64) {
+    static std::shared_ptr<sym_expr_t> make_var(int idx, int bits = 64)
+    {
         auto e = std::make_shared<sym_expr_t>();
         e->op = OP_VAR;
         e->var_idx = idx;
@@ -168,7 +172,8 @@ struct sym_expr_t {
     }
 
     static std::shared_ptr<sym_expr_t> make_binop(op_t o,
-        std::shared_ptr<sym_expr_t> l, std::shared_ptr<sym_expr_t> r) {
+        std::shared_ptr<sym_expr_t> l, std::shared_ptr<sym_expr_t> r)
+    {
         auto e = std::make_shared<sym_expr_t>();
         e->op = o;
         e->left = l;
@@ -177,7 +182,8 @@ struct sym_expr_t {
         return e;
     }
 
-    static std::shared_ptr<sym_expr_t> make_unop(op_t o, std::shared_ptr<sym_expr_t> operand) {
+    static std::shared_ptr<sym_expr_t> make_unop(op_t o, std::shared_ptr<sym_expr_t> operand)
+    {
         auto e = std::make_shared<sym_expr_t>();
         e->op = o;
         e->left = operand;

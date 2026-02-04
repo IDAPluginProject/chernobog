@@ -57,8 +57,8 @@ struct alignas(16) PatternStructure {
     // Check if candidate could match pattern (pattern may have wildcards)
     SIMD_FORCE_INLINE bool compatible_with(const PatternStructure& candidate) const {
         // Structural counts must match exactly
-        if (depth != candidate.depth) return false;
-        if (node_count != candidate.node_count) return false;
+        if ( depth != candidate.depth ) return false;
+        if ( node_count != candidate.node_count ) return false;
         // leaf_count can differ (pattern has variables, candidate has actual values)
         return true;
     }

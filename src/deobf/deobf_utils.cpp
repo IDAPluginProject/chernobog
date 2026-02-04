@@ -5,19 +5,22 @@ namespace deobf {
 
 static bool g_verbose = false;
 
-void set_verbose(bool v) {
+void set_verbose(bool v)
+{
     g_verbose = v;
 }
 
-void log(const char *fmt, ...) {
+void log(const char *fmt, ...)
+{
     va_list va;
     va_start(va, fmt);
     vmsg(fmt, va);
     va_end(va);
 }
 
-void log_verbose(const char *fmt, ...) {
-    if (!g_verbose)
+void log_verbose(const char *fmt, ...)
+{
+    if ( !g_verbose )
         return;
     va_list va;
     va_start(va, fmt);
@@ -28,26 +31,31 @@ void log_verbose(const char *fmt, ...) {
 //--------------------------------------------------------------------------
 // Microcode helpers
 //--------------------------------------------------------------------------
-minsn_t *find_insn_by_opcode(mblock_t *blk, mcode_t op) {
-    if (!blk)
+minsn_t *find_insn_by_opcode(mblock_t *blk, mcode_t op)
+{
+    if ( !blk )
         return nullptr;
 
-    for (minsn_t *insn = blk->head; insn; insn = insn->next) {
-        if (insn->opcode == op)
+    for ( minsn_t *insn = blk->head; insn; insn = insn->next )
+    {
+        if ( insn->opcode == op )
             return insn;
     }
     return nullptr;
 }
 
-bool is_jcc(mcode_t op) {
+bool is_jcc(mcode_t op)
+{
     return op >= m_jcnd && op <= m_jle;
 }
 
-bool is_unconditional_jmp(mcode_t op) {
+bool is_unconditional_jmp(mcode_t op)
+{
     return op == m_goto || op == m_ijmp;
 }
 
-const char *mcode_name(mcode_t op) {
+const char *mcode_name(mcode_t op)
+{
     static const char *names[] = {
         "m_nop", "m_stx", "m_ldx", "m_ldc", "m_mov", "m_neg", "m_lnot", "m_bnot",
         "m_xds", "m_xdu", "m_low", "m_high", "m_add", "m_sub", "m_mul", "m_udiv",
@@ -61,7 +69,7 @@ const char *mcode_name(mcode_t op) {
         "m_fneg", "m_fadd", "m_fsub", "m_fmul", "m_fdiv"
     };
 
-    if (op < sizeof(names)/sizeof(names[0]))
+    if ( op < sizeof(names)/sizeof(names[0]) )
         return names[op];
     return "m_unknown";
 }
@@ -69,51 +77,60 @@ const char *mcode_name(mcode_t op) {
 //--------------------------------------------------------------------------
 // Pattern matching helpers
 //--------------------------------------------------------------------------
-bool match_xor_pattern(minsn_t *insn, mop_t **out_left, mop_t **out_right) {
-    if (!insn || insn->opcode != m_xor)
+bool match_xor_pattern(minsn_t *insn, mop_t **out_left, mop_t **out_right)
+{
+    if ( !insn || insn->opcode != m_xor )
         return false;
 
-    if (out_left)
+    if ( out_left )
         *out_left = &insn->l;
-    if (out_right)
+    if ( out_right )
         *out_right = &insn->r;
 
     return true;
 }
 
-bool match_load_xor_pattern(mblock_t *blk, ea_t *out_enc_addr, uint64_t *out_key) {
+bool match_load_xor_pattern(mblock_t *blk, ea_t *out_enc_addr, uint64_t *out_key)
+{
     // Look for pattern:
     //   load tmp, [gvar1]
     //   xor result, tmp, const  (or xor result, tmp, [gvar2])
 
-    for (minsn_t *insn = blk->head; insn; insn = insn->next) {
-        if (insn->opcode != m_xor)
+    for ( minsn_t *insn = blk->head; insn; insn = insn->next )
+    {
+        if ( insn->opcode != m_xor )
             continue;
 
         // Check if one operand is a global variable load
         mop_t *load_op = nullptr;
         mop_t *key_op = nullptr;
 
-        if (insn->l.t == mop_v) {  // Left is a kreg that may have been loaded
+        if ( insn->l.t == mop_v )
+        {  // Left is a kreg that may have been loaded
             // Need to trace back to find the load
         }
 
-        if (insn->r.t == mop_n) {  // Right is immediate
+        if ( insn->r.t == mop_n )
+        {  // Right is immediate
             key_op = &insn->r;
             load_op = &insn->l;
-        } else if (insn->l.t == mop_n) {  // Left is immediate
+        }
+        else if ( insn->l.t == mop_n )
+        {  // Left is immediate
             key_op = &insn->l;
             load_op = &insn->r;
         }
 
-        if (key_op && load_op && key_op->t == mop_n) {
-            if (out_key)
+        if ( key_op && load_op && key_op->t == mop_n )
+        {
+            if ( out_key )
                 *out_key = key_op->nnn->value;
 
             // Try to find the source address
-            if (load_op->t == mop_v) {
+            if ( load_op->t == mop_v )
+            {
                 // It's a global variable
-                if (out_enc_addr)
+                if ( out_enc_addr )
                     *out_enc_addr = load_op->g;
                 return true;
             }
@@ -126,8 +143,10 @@ bool match_load_xor_pattern(mblock_t *blk, ea_t *out_enc_addr, uint64_t *out_key
 //--------------------------------------------------------------------------
 // Expression analysis
 //--------------------------------------------------------------------------
-sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx) {
-    switch (mop.t) {
+sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx)
+{
+    switch ( mop.t )
+    {
         case mop_n:  // Immediate number
             return sym_expr_t::make_const(mop.nnn->value, mop.size * 8);
 
@@ -140,8 +159,9 @@ sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx) {
         case mop_S:  // Stack variable
             return sym_expr_t::make_var(0x20000 + mop.s->off, mop.size * 8);
 
-        case mop_d: { // Nested instruction result
-            if (!mop.d)
+        case mop_d:
+        { // Nested instruction result
+            if ( !mop.d )
                 return nullptr;
 
             minsn_t *nested = mop.d;
@@ -149,7 +169,8 @@ sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx) {
             sym_expr_ptr right = mop_to_sym(nested->r, ctx);
 
             sym_expr_t::op_t op;
-            switch (nested->opcode) {
+            switch ( nested->opcode )
+            {
                 case m_add: op = sym_expr_t::OP_ADD; break;
                 case m_sub: op = sym_expr_t::OP_SUB; break;
                 case m_mul: op = sym_expr_t::OP_MUL; break;
@@ -164,7 +185,7 @@ sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx) {
                 default: return nullptr;
             }
 
-            if (op == sym_expr_t::OP_NEG || op == sym_expr_t::OP_NOT)
+            if ( op == sym_expr_t::OP_NEG || op == sym_expr_t::OP_NOT )
                 return sym_expr_t::make_unop(op, left);
             else
                 return sym_expr_t::make_binop(op, left, right);
@@ -175,25 +196,28 @@ sym_expr_ptr mop_to_sym(const mop_t &mop, deobf_ctx_t *ctx) {
     }
 }
 
-sym_expr_ptr simplify_expr(sym_expr_ptr expr) {
-    if (!expr)
+sym_expr_ptr simplify_expr(sym_expr_ptr expr)
+{
+    if ( !expr )
         return nullptr;
 
     // Recursively simplify children first
-    if (expr->left)
+    if ( expr->left )
         expr->left = simplify_expr(expr->left);
-    if (expr->right)
+    if ( expr->right )
         expr->right = simplify_expr(expr->right);
 
     // Constant folding
-    if (expr->left && expr->left->is_const() &&
-        expr->right && expr->right->is_const()) {
+    if ( expr->left && expr->left->is_const() &&
+        expr->right && expr->right->is_const() )
+    {
 
         uint64_t l = expr->left->const_val;
         uint64_t r = expr->right->const_val;
         uint64_t result = 0;
 
-        switch (expr->op) {
+        switch ( expr->op )
+        {
             case sym_expr_t::OP_ADD: result = l + r; break;
             case sym_expr_t::OP_SUB: result = l - r; break;
             case sym_expr_t::OP_MUL: result = l * r; break;
@@ -209,11 +233,13 @@ sym_expr_ptr simplify_expr(sym_expr_ptr expr) {
     }
 
     // Unary constant folding
-    if (expr->left && expr->left->is_const() && !expr->right) {
+    if ( expr->left && expr->left->is_const() && !expr->right )
+    {
         uint64_t v = expr->left->const_val;
         uint64_t result = 0;
 
-        switch (expr->op) {
+        switch ( expr->op )
+        {
             case sym_expr_t::OP_NEG: result = -v; break;
             case sym_expr_t::OP_NOT: result = ~v; break;
             default: return expr;
@@ -224,76 +250,86 @@ sym_expr_ptr simplify_expr(sym_expr_ptr expr) {
 
     // Algebraic simplifications
     // x XOR x = 0
-    if (expr->op == sym_expr_t::OP_XOR &&
+    if ( expr->op == sym_expr_t::OP_XOR &&
         expr->left && expr->right &&
         expr->left->is_var() && expr->right->is_var() &&
-        expr->left->var_idx == expr->right->var_idx) {
+        expr->left->var_idx == expr->right->var_idx )
+    {
         return sym_expr_t::make_const(0, expr->bit_size);
     }
 
     // x XOR 0 = x
-    if (expr->op == sym_expr_t::OP_XOR && expr->right && expr->right->is_const() &&
-        expr->right->const_val == 0) {
+    if ( expr->op == sym_expr_t::OP_XOR && expr->right && expr->right->is_const() &&
+        expr->right->const_val == 0 )
+    {
         return expr->left;
     }
 
     // x AND 0 = 0
-    if (expr->op == sym_expr_t::OP_AND && expr->right && expr->right->is_const() &&
-        expr->right->const_val == 0) {
+    if ( expr->op == sym_expr_t::OP_AND && expr->right && expr->right->is_const() &&
+        expr->right->const_val == 0 )
+    {
         return sym_expr_t::make_const(0, expr->bit_size);
     }
 
     // x OR 0 = x
-    if (expr->op == sym_expr_t::OP_OR && expr->right && expr->right->is_const() &&
-        expr->right->const_val == 0) {
+    if ( expr->op == sym_expr_t::OP_OR && expr->right && expr->right->is_const() &&
+        expr->right->const_val == 0 )
+    {
         return expr->left;
     }
 
     // x + 0 = x
-    if (expr->op == sym_expr_t::OP_ADD && expr->right && expr->right->is_const() &&
-        expr->right->const_val == 0) {
+    if ( expr->op == sym_expr_t::OP_ADD && expr->right && expr->right->is_const() &&
+        expr->right->const_val == 0 )
+    {
         return expr->left;
     }
 
     // x - 0 = x
-    if (expr->op == sym_expr_t::OP_SUB && expr->right && expr->right->is_const() &&
-        expr->right->const_val == 0) {
+    if ( expr->op == sym_expr_t::OP_SUB && expr->right && expr->right->is_const() &&
+        expr->right->const_val == 0 )
+    {
         return expr->left;
     }
 
     // NOT(NOT(x)) = x
-    if (expr->op == sym_expr_t::OP_NOT && expr->left &&
-        expr->left->op == sym_expr_t::OP_NOT) {
+    if ( expr->op == sym_expr_t::OP_NOT && expr->left &&
+        expr->left->op == sym_expr_t::OP_NOT )
+    {
         return expr->left->left;
     }
 
     // NEG(NEG(x)) = x
-    if (expr->op == sym_expr_t::OP_NEG && expr->left &&
-        expr->left->op == sym_expr_t::OP_NEG) {
+    if ( expr->op == sym_expr_t::OP_NEG && expr->left &&
+        expr->left->op == sym_expr_t::OP_NEG )
+    {
         return expr->left->left;
     }
 
     return expr;
 }
 
-std::optional<uint64_t> eval_const_expr(sym_expr_ptr expr) {
+std::optional<uint64_t> eval_const_expr(sym_expr_ptr expr)
+{
     sym_expr_ptr simplified = simplify_expr(expr);
-    if (simplified && simplified->is_const())
+    if ( simplified && simplified->is_const() )
         return simplified->const_val;
     return std::nullopt;
 }
 
-bool exprs_equivalent(sym_expr_ptr a, sym_expr_ptr b) {
-    if (!a || !b)
+bool exprs_equivalent(sym_expr_ptr a, sym_expr_ptr b)
+{
+    if ( !a || !b )
         return a == b;
 
-    if (a->op != b->op)
+    if ( a->op != b->op )
         return false;
 
-    if (a->is_const() && b->is_const())
+    if ( a->is_const() && b->is_const() )
         return a->const_val == b->const_val;
 
-    if (a->is_var() && b->is_var())
+    if ( a->is_var() && b->is_var() )
         return a->var_idx == b->var_idx;
 
     return exprs_equivalent(a->left, b->left) &&

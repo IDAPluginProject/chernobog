@@ -21,7 +21,7 @@
 //    -> Reconstructs the string from individual assignments
 //
 // 3. XOR decryption loops:
-//    for (i = 0; i < len; i++) dest[i] = src[i] ^ key[i];
+//    for ( i = 0; i < len; ++i ) dest[i] = src[i] ^ key[i];
 //    -> Identifies XOR operations and extracts key if constant
 //
 // 4. AES/Crypto parameter detection:

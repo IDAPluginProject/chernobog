@@ -3,18 +3,19 @@
 //--------------------------------------------------------------------------
 // Detection
 //--------------------------------------------------------------------------
-bool global_const_handler_t::detect(mbl_array_t *mba) {
-    if (!mba)
+bool global_const_handler_t::detect(mbl_array_t *mba)
+{
+    if ( !mba ) 
         return false;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             global_const_t gc;
-            if (is_global_const_load(ins, &gc)) {
+            if ( is_global_const_load(ins, &gc) ) {
                 return true;
             }
         }
@@ -26,8 +27,9 @@ bool global_const_handler_t::detect(mbl_array_t *mba) {
 //--------------------------------------------------------------------------
 // Main deobfuscation pass
 //--------------------------------------------------------------------------
-int global_const_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
-    if (!mba || !ctx)
+int global_const_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx)
+{
+    if ( !mba || !ctx ) 
         return 0;
 
     deobf::log("[global_const] Starting global constant inlining\n");
@@ -37,14 +39,14 @@ int global_const_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
     auto global_consts = find_global_consts(mba);
     deobf::log("[global_const] Found %zu global constants to inline\n", global_consts.size());
 
-    for (const auto &gc : global_consts) {
-        for (int i = 0; i < mba->qty; i++) {
+    for ( const auto &gc : global_consts ) {
+        for ( int i = 0; i < mba->qty; ++i ) {
             mblock_t *blk = mba->get_mblock(i);
-            if (!blk)
+            if ( !blk ) 
                 continue;
 
-            for (minsn_t *ins = blk->head; ins; ins = ins->next) {
-                if (ins == gc.insn) {
+            for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
+                if ( ins == gc.insn ) {
                     total_changes += replace_with_constant(blk, ins, gc);
                     deobf::log("[global_const] Inlined constant at %a: 0x%llx\n",
                               gc.gv_addr, (unsigned long long)gc.value);
@@ -62,11 +64,11 @@ int global_const_handler_t::run(mbl_array_t *mba, deobf_ctx_t *ctx) {
 // Instruction-level simplification
 //--------------------------------------------------------------------------
 int global_const_handler_t::simplify_insn(mblock_t *blk, minsn_t *ins, deobf_ctx_t *ctx) {
-    if (!ins)
+    if ( !ins ) 
         return 0;
 
     global_const_t gc;
-    if (is_global_const_load(ins, &gc)) {
+    if ( is_global_const_load(ins, &gc) ) {
         return replace_with_constant(blk, ins, gc);
     }
 
@@ -77,17 +79,18 @@ int global_const_handler_t::simplify_insn(mblock_t *blk, minsn_t *ins, deobf_ctx
 // Find global constants
 //--------------------------------------------------------------------------
 std::vector<global_const_handler_t::global_const_t>
-global_const_handler_t::find_global_consts(mbl_array_t *mba) {
+global_const_handler_t::find_global_consts(mbl_array_t *mba)
+{
     std::vector<global_const_t> result;
 
-    for (int i = 0; i < mba->qty; i++) {
+    for ( int i = 0; i < mba->qty; ++i ) {
         mblock_t *blk = mba->get_mblock(i);
-        if (!blk)
+        if ( !blk ) 
             continue;
 
-        for (minsn_t *ins = blk->head; ins; ins = ins->next) {
+        for ( minsn_t *ins = blk->head; ins; ins = ins->next ) {
             global_const_t gc;
-            if (is_global_const_load(ins, &gc)) {
+            if ( is_global_const_load(ins, &gc) ) {
                 result.push_back(gc);
             }
         }
@@ -99,13 +102,14 @@ global_const_handler_t::find_global_consts(mbl_array_t *mba) {
 //--------------------------------------------------------------------------
 // Check if instruction loads from a constant global
 //--------------------------------------------------------------------------
-bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *out) {
-    if (!ins)
+bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *out)
+{
+    if ( !ins ) 
         return false;
 
     // We're looking for mov instructions that load from a global
     // Pattern: mov dst, gv  (where gv is a global variable)
-    if (ins->opcode != m_mov && ins->opcode != m_ldx)
+    if ( ins->opcode != m_mov && ins->opcode != m_ldx ) 
         return false;
 
 
@@ -114,31 +118,31 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
     mop_t *gv_mop = nullptr;
 
     // Check for direct global reference in left operand
-    if (ins->l.t == mop_v) {
+    if ( ins->l.t == mop_v ) {
         gv_addr = ins->l.g;
         size = ins->l.size;
         gv_mop = &ins->l;
     }
     // Check for load from global (ldx pattern)
-    else if (ins->opcode == m_ldx) {
+    else if ( ins->opcode == m_ldx ) {
         // ldx dst, seg, addr - check if addr is a global
-        if (ins->r.t == mop_v) {
+        if ( ins->r.t == mop_v ) {
             gv_addr = ins->r.g;
             size = ins->d.size;
             gv_mop = &ins->r;
         }
         // Also check for address-of global: ldx dst, seg, &global
         // At early maturity, globals may be wrapped in mop_a
-        else if (ins->r.t == mop_a && ins->r.a && ins->r.a->t == mop_v) {
+        else if ( ins->r.t == mop_a && ins->r.a && ins->r.a->t == mop_v ) {
             gv_addr = ins->r.a->g;
             size = ins->d.size;
             gv_mop = ins->r.a;
         }
         // Check for immediate address (mop_n) which might be a global
-        else if (ins->r.t == mop_n) {
+        else if ( ins->r.t == mop_n ) {
             ea_t addr = (ea_t)ins->r.nnn->value;
             // Verify it's a valid data address
-            if (getseg(addr) != nullptr) {
+            if ( getseg(addr) != nullptr ) {
                 gv_addr = addr;
                 size = ins->d.size;
                 gv_mop = &ins->r;
@@ -146,27 +150,27 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
         }
         // Check for computed address (mop_d) - result of add/sub with constants
         // Pattern: ldx dst, seg, (base + offset) where base is a global address
-        else if (ins->r.t == mop_d && ins->r.d) {
+        else if ( ins->r.t == mop_d && ins->r.d ) {
             minsn_t *addr_ins = ins->r.d;
             // Check for add with constant offset: add result, base, offset
-            if (addr_ins->opcode == m_add) {
+            if ( addr_ins->opcode == m_add ) {
                 ea_t base_addr = BADADDR;
                 int64_t offset = 0;
 
                 // Check if left is global/number and right is number
-                if (addr_ins->l.t == mop_v) {
+                if ( addr_ins->l.t == mop_v ) {
                     base_addr = addr_ins->l.g;
-                } else if (addr_ins->l.t == mop_n) {
+                } else if ( addr_ins->l.t == mop_n ) {
                     base_addr = (ea_t)addr_ins->l.nnn->value;
-                } else if (addr_ins->l.t == mop_a && addr_ins->l.a && addr_ins->l.a->t == mop_v) {
+                } else if ( addr_ins->l.t == mop_a && addr_ins->l.a && addr_ins->l.a->t == mop_v ) {
                     base_addr = addr_ins->l.a->g;
                 }
 
-                if (addr_ins->r.t == mop_n) {
+                if ( addr_ins->r.t == mop_n ) {
                     offset = addr_ins->r.nnn->value;
                 }
 
-                if (base_addr != BADADDR && getseg(base_addr) != nullptr) {
+                if ( base_addr != BADADDR && getseg(base_addr) != nullptr ) {
                     gv_addr = base_addr + offset;
                     size = ins->d.size;
                     gv_mop = &ins->r;
@@ -175,26 +179,26 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
         }
     }
 
-    if (gv_addr == BADADDR || size <= 0 || size > 8)
+    if ( gv_addr == BADADDR || size <= 0 || size > 8 ) 
         return false;
 
     // Verify it's a data location, not code
     flags64_t flags = get_flags(gv_addr);
-    if (is_code(flags))
+    if ( is_code(flags) ) 
         return false;
 
     // Check if it's in a const data section
-    if (!is_const_data(gv_addr))
+    if ( !is_const_data(gv_addr) ) 
         return false;
 
     // Read the value
     uint64_t value = read_global_value(gv_addr, size);
 
     // Skip if value looks like a pointer (we don't want to inline pointers)
-    if (looks_like_pointer(value, size))
+    if ( looks_like_pointer(value, size) ) 
         return false;
 
-    if (out) {
+    if ( out ) {
         out->insn = ins;
         out->gv_mop = gv_mop;
         out->gv_addr = gv_addr;
@@ -208,9 +212,10 @@ bool global_const_handler_t::is_global_const_load(minsn_t *ins, global_const_t *
 //--------------------------------------------------------------------------
 // Check if address is in a read-only/const data section
 //--------------------------------------------------------------------------
-bool global_const_handler_t::is_const_data(ea_t addr) {
+bool global_const_handler_t::is_const_data(ea_t addr)
+{
     segment_t *seg = getseg(addr);
-    if (!seg)
+    if ( !seg ) 
         return false;
 
     // Check segment name for common const data patterns
@@ -218,23 +223,24 @@ bool global_const_handler_t::is_const_data(ea_t addr) {
     get_segm_name(&seg_name, seg);
 
     // Common read-only section names
-    if (seg_name == "__const" ||
+    if ( seg_name == "__const" ||
         seg_name == ".rodata" ||
         seg_name == ".rdata" ||
         seg_name == "__DATA_CONST" ||
         seg_name == "__cstring" ||
-        seg_name == "__cfstring") {
+        seg_name == "__cfstring")
+        {
         return true;
     }
 
     // Also accept __data and .data for now - constants can be there too
     // But be more conservative
-    if (seg_name == "__data" || seg_name == ".data") {
+    if ( seg_name == "__data" || seg_name == ".data" ) {
         // Check if the value has xrefs that suggest it's not modified
         xrefblk_t xb;
         bool has_write_xref = false;
-        for (bool ok = xb.first_to(addr, XREF_ALL); ok; ok = xb.next_to()) {
-            if (xb.type == dr_W) {
+        for ( bool ok = xb.first_to(addr, XREF_ALL); ok; ok = xb.next_to() ) {
+            if ( xb.type == dr_W ) {
                 has_write_xref = true;
                 break;
             }
@@ -243,7 +249,7 @@ bool global_const_handler_t::is_const_data(ea_t addr) {
     }
 
     // Check segment permissions if available
-    if ((seg->perm & SEGPERM_WRITE) == 0) {
+    if ( (seg->perm & SEGPERM_WRITE) == 0 ) {
         return true;
     }
 
@@ -253,26 +259,27 @@ bool global_const_handler_t::is_const_data(ea_t addr) {
 //--------------------------------------------------------------------------
 // Heuristic to detect pointer values
 //--------------------------------------------------------------------------
-bool global_const_handler_t::looks_like_pointer(uint64_t val, int size) {
-    if (size < 4)
+bool global_const_handler_t::looks_like_pointer(uint64_t val, int size)
+{
+    if ( size < 4 ) 
         return false;
 
     // 0 could be NULL pointer but also a valid constant
-    if (val == 0)
+    if ( val == 0 ) 
         return false;
 
     // Check if it falls within any segment
-    if (getseg((ea_t)val) != nullptr)
+    if ( getseg((ea_t)val) != nullptr ) 
         return true;
 
     // Common pointer patterns for 64-bit
-    if (size == 8) {
+    if ( size == 8 ) {
         // Typical macOS/iOS ASLR range (0x1XXXXXXXXXX)
-        if ((val >> 40) == 0x1)
+        if ( (val >> 40) == 0x1 ) 
             return true;
         // Linux typical user-space ranges (0x5XXXXXXXXX, 0x7XXXXXXXXX)
         uint64_t top_nibble = val >> 44;
-        if (top_nibble == 0x5 || top_nibble == 0x7)
+        if ( top_nibble == 0x5 || top_nibble == 0x7 ) 
             return true;
     }
 
@@ -282,10 +289,11 @@ bool global_const_handler_t::looks_like_pointer(uint64_t val, int size) {
 //--------------------------------------------------------------------------
 // Read value from global
 //--------------------------------------------------------------------------
-uint64_t global_const_handler_t::read_global_value(ea_t addr, int size) {
+uint64_t global_const_handler_t::read_global_value(ea_t addr, int size)
+{
     uint64_t val = 0;
 
-    switch (size) {
+    switch ( size ) {
         case 1:
             val = get_byte(addr);
             break;
@@ -310,9 +318,10 @@ uint64_t global_const_handler_t::read_global_value(ea_t addr, int size) {
 // Replace load with constant
 //--------------------------------------------------------------------------
 int global_const_handler_t::replace_with_constant(mblock_t *blk, minsn_t *ins,
-    const global_const_t &gc) {
+    const global_const_t &gc)
+    {
 
-    if (!ins)
+    if ( !ins ) 
         return 0;
 
     // Transform: mov dst, gv  ->  mov dst, immediate
