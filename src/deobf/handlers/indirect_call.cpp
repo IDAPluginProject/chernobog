@@ -26,6 +26,35 @@ static void icall_debug(const char *fmt, ...)
 #endif
 }
 
+static bool is_valid_database_ea(ea_t ea)
+{
+    if ( ea == BADADDR )
+        return false;
+
+    const ea_t min_ea = inf_get_min_ea();
+    const ea_t max_ea = inf_get_max_ea();
+    return ea >= min_ea && ea < max_ea;
+}
+
+static bool is_code_ea(ea_t ea)
+{
+    return is_valid_database_ea(ea) && is_code(get_flags(ea));
+}
+
+static func_t *get_func_safe(ea_t ea)
+{
+    if ( !is_valid_database_ea(ea) )
+        return nullptr;
+    return get_func(ea);
+}
+
+static flags64_t get_flags_safe(ea_t ea)
+{
+    if ( !is_valid_database_ea(ea) )
+        return 0;
+    return get_flags(ea);
+}
+
 //--------------------------------------------------------------------------
 // Detection - look for indirect call patterns
 //
@@ -86,7 +115,7 @@ bool indirect_call_handler_t::detect(mbl_array_t *mba)
                 // Check if this looks like a code pointer table
                 uint64_t first_val = 0;
                 if ( get_bytes(&first_val, 8, ea) == 8 ) {
-                    if ( first_val != 0 && is_code(get_flags((ea_t)first_val)) ) {
+                    if ( first_val != 0 && is_code_ea((ea_t)first_val) ) {
                         // This might be a code pointer table
                         // Check if it's referenced in the function
                         xrefblk_t xb;
@@ -214,7 +243,7 @@ indirect_call_handler_t::find_indirect_calls(mbl_array_t *mba)
                         
                         ea_t final_target = frameless_continuation_t::resolve_continuation_jump(call_target, caller_ctx);
                         
-                        if ( final_target != BADADDR && is_code(get_flags(final_target)) ) {
+                        if ( is_code_ea(final_target) ) {
                             icall_debug("[indirect_call] Resolved frameless continuation: 0x%llx -> 0x%llx\n",
                                        (unsigned long long)call_target, (unsigned long long)final_target);
                             
@@ -315,7 +344,7 @@ indirect_call_handler_t::find_indirect_calls(mbl_array_t *mba)
                                     ea_t global = prev->l.a->g;
                                     uint64_t first_entry = 0;
                                     if ( get_bytes(&first_entry, 8, global) == 8 ) {
-                                        if ( first_entry != 0 && is_code(get_flags((ea_t)first_entry)) ) {
+                                        if ( first_entry != 0 && is_code_ea((ea_t)first_entry) ) {
                                             ic.table_addr = global;
                                             icall_debug("[indirect_call]   Table candidate: 0x%llx\n",
                                                         (unsigned long long)global);
@@ -718,7 +747,7 @@ static hikari_pattern_t scan_binary_for_pattern(ea_t func_start, ea_t func_end) 
                 // Check if it's a pointer to code
                 uint64_t ptr_val = 0;
                 if ( get_bytes(&ptr_val, 8, target) == 8 ) {
-                    if ( ptr_val != 0 && is_code(get_flags((ea_t)ptr_val)) ) {
+                    if ( ptr_val != 0 && is_code_ea((ea_t)ptr_val) ) {
                         table_lea = target;
                         icall_debug("[indirect_call] Binary scan: found table LEA at 0x%llx -> 0x%llx\n",
                                    (unsigned long long)ea, (unsigned long long)target);
@@ -859,7 +888,7 @@ bool indirect_call_handler_t::trace_call_target(mblock_t *blk, minsn_t *call_ins
                     ea_t global = ins->l.a->g;
                     uint64_t first_entry = 0;
                     if ( get_bytes(&first_entry, 8, global) == 8 ) {
-                        if ( first_entry != 0 && is_code(get_flags((ea_t)first_entry)) ) {
+                        if ( first_entry != 0 && is_code_ea((ea_t)first_entry) ) {
                             tables.push_back(global);
                             icall_debug("[indirect_call]     Found table: 0x%llx (first_entry=0x%llx)\n",
                                         (unsigned long long)global, (unsigned long long)first_entry);
@@ -997,7 +1026,7 @@ bool indirect_call_handler_t::trace_call_target(mblock_t *blk, minsn_t *call_ins
             if ( get_bytes(&entry_val, 8, entry_addr) == 8 ) {
                 ea_t target = (ea_t)(entry_val - resolved_offset);
                 // Check if result is valid code
-                if ( is_code(get_flags(target)) || get_func(target) != nullptr ) {
+                if ( is_code_ea(target) || get_func_safe(target) != nullptr ) {
                     resolved_index = (int)idx_val;
                     icall_debug("[indirect_call]       VALIDATED index %lld: table[%lld]=0x%llx, -offset=0x%llx (valid code)\n",
                                 (long long)idx_val, (long long)idx_val,
@@ -1097,12 +1126,12 @@ ea_t indirect_call_handler_t::compute_target(ea_t table_addr, int index, int64_t
                 (unsigned long long)target);
 
     // Validate target is code
-    if ( is_code(get_flags(target)) ) {
+    if ( is_code_ea(target) ) {
         return target;
     }
 
     // Might still be valid if within function bounds
-    func_t *func = get_func(target);
+    func_t *func = get_func_safe(target);
     if ( func ) {
         return target;
     }
@@ -1135,11 +1164,17 @@ int indirect_call_handler_t::replace_indirect_call(mbl_array_t *mba, mblock_t *b
 
     // Check if the target is a valid function entry point
     // If not, we risk crashing IDA with INTERR 50822
-    func_t *target_func = get_func(ic.resolved_target);
+    if ( !is_valid_database_ea(ic.resolved_target) ) {
+        icall_debug("[indirect_call]   Target 0x%llx is outside database EA range, skipping replacement\n",
+                    (unsigned long long)ic.resolved_target);
+        return 0;
+    }
+
+    func_t *target_func = get_func_safe(ic.resolved_target);
     bool is_func_start = (target_func && target_func->start_ea == ic.resolved_target);
     
     // Also check if it might be an external/import
-    flags64_t flags = get_flags(ic.resolved_target);
+    flags64_t flags = get_flags_safe(ic.resolved_target);
     bool is_extern = has_any_name(flags) && !is_code(flags);
     
     icall_debug("[indirect_call]   Target check: is_func=%d, is_func_start=%d, is_extern=%d\n",
@@ -1154,7 +1189,7 @@ int indirect_call_handler_t::replace_indirect_call(mbl_array_t *mba, mblock_t *b
         if ( !target_func && is_code(flags) ) {
             icall_debug("[indirect_call]   Attempting to create function at target...\n");
             if ( add_func(ic.resolved_target) ) {
-                target_func = get_func(ic.resolved_target);
+                target_func = get_func_safe(ic.resolved_target);
                 is_func_start = (target_func && target_func->start_ea == ic.resolved_target);
                 icall_debug("[indirect_call]   Created function: is_func_start=%d\n", is_func_start);
             } else {
