@@ -79,7 +79,7 @@ Chernobog automatically detects and reverses the following Hikari obfuscation te
 - **Indirect Calls** - Resolves Hikari's `call(table[index] - offset)` pattern to direct calls
 - **Recurrent-Resolver Argument Cleanup** - Neutralizes call-site argument expressions in ABI registers that a recurrent, statically closed resolver thunk provably never reads; the physical ABI slots are retained so live arguments do not shift (default-on at `MMAT_CALLS`)
 - **Select-Chain Collapse** - Collapses long cascades of conditional-move (select) diamonds from LLVM select lowering into equivalent branchless expressions, keeping very long chains within Hex-Rays' structural limits
-- **Cross-Function Dispatch (opt-in, `CHERNOBOG_HIKARI_CFG`)** - Recovers Hikari's two-target ARM64 dispatch encoding across IDA function boundaries (relocation table + `CSET` index + signed bias, with an observed XOR key), adds exact IDB edges/comments, and can optionally rewrite side-effect-free dispatch tails to direct conditional branches
+- **Cross-Function Dispatch (opt-in, `CHERNOBOG_HIKARI_CFG`)** - Recovers Hikari's two-target ARM64 dispatch encoding across IDA function boundaries (relocation table + `CSET` index + signed bias, with an observed XOR key), adds exact IDB edges/comments, and can optionally replace the dispatch-target computation of compact tails with direct conditional branches
 - **Aliased State Recovery** - Resolves proven x86 stack-pointer aliases and threads signed comparison dispatchers, preserving shared assignments and runtime branches. Optional bounded frame-object assumptions extend call-crossing recovery; see [contracts and validation](docs/hikari-state-recovery.md).
 - **Native Forwarding Adapters** - Inlines bounded AMD64 call/return wrappers, including mutable indirect calls, using native microcode generation. Return-register restoration and other unsupported bodies remain separate calls; see [admission and validation](docs/native-forwarders.md).
 
@@ -480,7 +480,7 @@ without applying any deobfuscation.
 | `CHERNOBOG_PATCH_BRANCHES=1` | Retained for configuration compatibility; optimized-IR tail targets no longer authorize native branch patches |
 | `CHERNOBOG_DEAD_GLOBAL_STORES=1` | Remove direct stores to auto-named writable scalars with write xrefs but no direct reads, fixups, data references, or user/export names |
 | `CHERNOBOG_HIKARI_CFG=1` | Recover exact two-target ARM64 Hikari dispatch edges across IDA function boundaries and add IDB xrefs/comments |
-| `CHERNOBOG_HIKARI_CFG=2` | Additionally rewrite side-effect-free dispatch tails to reversible direct conditional branches |
+| `CHERNOBOG_HIKARI_CFG=2` | Additionally replace the dispatch-target computation of compact tails with reversible direct conditional branches, keeping stores and hoisted values |
 | `CHERNOBOG_MBA_AFFINE=1` | Enable exact-Z3 affine MBA reconstruction (opt-in) |
 | `CHERNOBOG_MBA_SMT=0` | Disable bounded semantic MBA synthesis and caller-context simplification (default-on; IDC alias `mba_smt`) |
 | `CHERNOBOG_MBA_BACKEND=cobra\|legacy` | Select the algebraic generator (default `cobra`); `legacy` retains the previous generator. Builds with `CHERNOBOG_WITH_COBRA=OFF` use Legacy. Both generators retain candidate and emitted-code Z3 proofs; see [CoBRA validation](docs/MBA_COBRA_VALIDATION.md). |
@@ -570,10 +570,12 @@ two-entry relocation tables in one root block, indexes them with `CSET`, and
 adds a shared signed 32-bit bias before `BR`. Recovery requires two loader
 fixups, a unique pair of executable function-entry targets, and an XOR key
 observed in the same register in the corpus. Tier 1 leaves instructions intact.
-Tier 2 rewrites only compact spans containing whitelisted loads/addressing and
-arithmetic, with no external incoming edge or observable store/call; the
-predicate-result store is retained. IDA retains the original bytes for revert,
-and the input file is never modified.
+Tier 2 rewrites only compact spans that have no external incoming edge: the
+instructions that compute the target (table load, index, keyed bias arithmetic
+and any PC-relative materialization) become direct conditional branches, while
+stores and every other value a successor block may read stay in place. Hikari
+hoists such values across dispatch edges, so they are not treated as dead. IDA
+retains the original bytes for revert, and the input file is never modified.
 
 ### Plugin Info
 

@@ -17,6 +17,7 @@
 #include <array>
 #include <deque>
 #include <limits>
+#include <set>
 #include <tuple>
 
 namespace
@@ -67,18 +68,19 @@ bool is_full_immediate_move(const insn_t &instruction)
            instruction.Op1.type == o_reg && instruction.Op2.type == o_imm;
 }
 
+void cfg_log(const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    deobf::debug_vlog("/tmp/chernobog_hikari_cfg.log", format, arguments);
+    va_end(arguments);
+}
+
 void cfg_debug(ea_t function_ea, const char *reason)
 {
     if (!deobf::debug_enabled())
         return;
-    qstring line;
-    line.sprnt("function=%a reject=%s\n", function_ea, reason);
-    FILE *file = qfopen("/tmp/chernobog_hikari_cfg.log", "a");
-    if (file)
-    {
-        qfwrite(file, line.c_str(), line.length());
-        qfclose(file);
-    }
+    cfg_log("function=%a reject=%s\n", function_ea, reason);
 }
 
 bool is_changed_register(const insn_t &instruction, int *out)
@@ -229,15 +231,8 @@ infer_targets(ea_t table, int key_reg, const std::optional<uint32_t> &local_key,
     {
         if (deobf::debug_enabled())
         {
-            qstring detail;
-            detail.sprnt("infer table=%a candidates=%zu key_reg=%d local=%X\n", table,
-                         candidates.size(), key_reg, local_key ? *local_key : uint32_t{0});
-            FILE *file = qfopen("/tmp/chernobog_hikari_cfg.log", "a");
-            if (file)
-            {
-                qfwrite(file, detail.c_str(), detail.length());
-                qfclose(file);
-            }
+            cfg_log("infer table=%a candidates=%zu key_reg=%d local=%X\n", table, candidates.size(),
+                    key_reg, local_key ? *local_key : uint32_t{0});
         }
         return std::nullopt;
     }
@@ -424,20 +419,13 @@ std::optional<dispatcher_proof_t> analyze_dispatcher(func_t *function,
     {
         if (deobf::debug_enabled())
         {
-            qstring detail;
-            detail.sprnt("function=%a detail table=%a key_reg=%d local_key=%llX "
-                         "entry0=%llX entry1=%llX encoded=%X\n",
-                         function->start_ea, table->second, key_reg,
-                         static_cast<unsigned long long>(local_key ? *local_key : uint32_t{0}),
-                         static_cast<unsigned long long>(get_qword(table->second)),
-                         static_cast<unsigned long long>(get_qword(table->second + 8)),
-                         get_dword(table->second + 16));
-            FILE *file = qfopen("/tmp/chernobog_hikari_cfg.log", "a");
-            if (file)
-            {
-                qfwrite(file, detail.c_str(), detail.length());
-                qfclose(file);
-            }
+            cfg_log("function=%a detail table=%a key_reg=%d local_key=%llX "
+                    "entry0=%llX entry1=%llX encoded=%X\n",
+                    function->start_ea, table->second, key_reg,
+                    static_cast<unsigned long long>(local_key ? *local_key : uint32_t{0}),
+                    static_cast<unsigned long long>(get_qword(table->second)),
+                    static_cast<unsigned long long>(get_qword(table->second + 8)),
+                    get_dword(table->second + 16));
         }
         cfg_debug(function->start_ea, "target/key inference not unique");
         return std::nullopt;
@@ -486,7 +474,10 @@ bool has_external_incoming_edge(ea_t ea, ea_t range_start, ea_t range_end)
     return false;
 }
 
-bool patchable_dispatch_instruction(const insn_t &instruction)
+// Instructions whose only effect is a register value. None of them updates
+// NZCV, so the compare that produced the dispatch condition still describes
+// the branch after the instruction is removed.
+bool pure_dispatch_instruction(const insn_t &instruction)
 {
     switch (instruction.itype)
     {
@@ -500,84 +491,409 @@ bool patchable_dispatch_instruction(const insn_t &instruction)
     case ARM_neg:
     case ARM_eor:
     case ARM_add:
+    case ARM_sub:
+    case ARM_and:
+    case ARM_orr:
+    case ARM_lsl:
+    case ARM_lsr:
+    case ARM_asr:
         return true;
     default:
         return false;
     }
 }
 
+bool is_dispatch_store(const insn_t &instruction)
+{
+    switch (instruction.itype)
+    {
+    case ARM_str:
+    case ARM_stur:
+    case ARM_stp:
+    case ARM_stnp:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_pc_relative(const insn_t &instruction)
+{
+    if (instruction.itype == ARM_adr || instruction.itype == ARM_adrp ||
+        instruction.itype == ARM_adrl)
+    {
+        return true;
+    }
+    return (instruction.itype == ARM_ldr || instruction.itype == ARM_ldur) &&
+           instruction.Op2.type == o_imm;
+}
+
+// A PC-relative materialization names an address that can outlive the tail:
+// Hikari blocks share hoisted global-address registers across their dispatch
+// edges. Such an instruction is kept and re-encoded for its new slot rather
+// than discarded with the rest of the target computation.
+std::optional<uint32_t> relocate_pc_relative(const insn_t &instruction, ea_t site, ea_t new_site)
+{
+    if (instruction.Op1.type != o_reg)
+        return std::nullopt;
+    const uint32_t word = get_dword(site);
+    // The low five bits are the architectural register field. IDA register
+    // numbers are wider than that field, so re-encode from the raw word.
+    const uint32_t rd = word & 0x1FU;
+    if (instruction.itype == ARM_adrp || instruction.itype == ARM_adr)
+    {
+        int64_t immediate = (int64_t((word >> 5) & 0x7FFFFU) << 2) | ((word >> 29) & 3U);
+        if ((immediate & (int64_t(1) << 20)) != 0)
+            immediate -= int64_t(1) << 21;
+        const bool page = instruction.itype == ARM_adrp;
+        const ea_t base = page ? (site & ~ea_t(0xFFF)) : site;
+        const int64_t target = int64_t(base) + (page ? (immediate << 12) : immediate);
+        const ea_t new_base = page ? (new_site & ~ea_t(0xFFF)) : new_site;
+        const int64_t delta = target - int64_t(new_base);
+        if (page && (delta & 0xFFF) != 0)
+            return std::nullopt;
+        const int64_t scaled = page ? (delta >> 12) : delta;
+        if (scaled < -(int64_t(1) << 20) || scaled >= (int64_t(1) << 20))
+            return std::nullopt;
+        const uint32_t immlo = uint32_t(scaled) & 3U;
+        const uint32_t immhi = (uint32_t(scaled) >> 2) & 0x7FFFFU;
+        const uint32_t opcode = page ? 0x90000000U : 0x10000000U;
+        return opcode | (immlo << 29) | (immhi << 5) | rd;
+    }
+    if (instruction.itype == ARM_ldr && instruction.Op2.type == o_imm)
+    {
+        int64_t offset = (int64_t((word >> 5) & 0x7FFFFU) << 2) | ((word >> 29) & 3U);
+        if ((offset & (int64_t(1) << 20)) != 0)
+            offset -= int64_t(1) << 21;
+        const int64_t delta = (int64_t(site) + offset) - int64_t(new_site);
+        if ((delta & 3) != 0 || delta < -(int64_t(1) << 20) || delta >= (int64_t(1) << 20))
+            return std::nullopt;
+        return (word & ~0x00FFFFE0U) | ((uint32_t(delta >> 2) & 0x7FFFFU) << 5);
+    }
+    return std::nullopt;
+}
+
+void register_operands(const insn_t &instruction, std::vector<int> *changed, std::vector<int> *used)
+{
+    const uint32 feature = instruction.get_canon_feature(PH);
+    for (int index = 0; index < UA_MAXOP; ++index)
+    {
+        const op_t &operand = instruction.ops[index];
+        if (operand.type == o_void)
+            break;
+        const bool writes = has_cf_chg(feature, index);
+        if (operand.type == o_reg)
+        {
+            if (writes)
+            {
+                if (changed)
+                    changed->push_back(operand.reg);
+            }
+            else if (has_cf_use(feature, index) && used)
+            {
+                used->push_back(operand.reg);
+            }
+        }
+        else if (operand.type == o_displ || operand.type == o_phrase)
+        {
+            // The base register is read even when the operand as a whole is
+            // the written memory location.
+            if (used)
+                used->push_back(operand.reg);
+        }
+    }
+}
+
+// Walk the definitions that feed the indirect branch: the loaded table entry,
+// the index, the keyed-bias arithmetic and the page holding the encoded bias.
+// Only these instructions compute the dispatch target, so only these can be
+// discarded once the target is a constant. Every other instruction in the tail
+// may carry a value into the successor block; Hikari hoists such values across
+// dispatch edges, so they are kept.
+std::set<ea_t> target_chain(const dispatcher_proof_t &proof, size_t patch_index)
+{
+    std::set<ea_t> chain;
+    std::vector<int> used;
+    const size_t branch_index = proof.tail.size() - 1;
+    register_operands(proof.tail[branch_index].insn, nullptr, &used);
+    std::deque<std::pair<size_t, int>> work;
+    for (int reg : used)
+        work.emplace_back(branch_index, reg);
+    while (!work.empty())
+    {
+        const auto [user, reg] = work.front();
+        work.pop_front();
+        const int definition = find_previous_definition(proof.tail, user, reg);
+        if (definition < 0 || static_cast<size_t>(definition) < patch_index)
+            continue;
+        const native_insn_t &item = proof.tail[static_cast<size_t>(definition)];
+        if (!chain.insert(item.ea).second)
+            continue;
+        std::vector<int> reads;
+        register_operands(item.insn, nullptr, &reads);
+        for (int read : reads)
+            work.emplace_back(static_cast<size_t>(definition), read);
+    }
+    return chain;
+}
+
+// Stores and the pure dispatch instructions do not update NZCV. The compare
+// that produced the dispatch condition can therefore sit further back than the
+// instruction immediately before the index selection.
+bool flag_neutral(const insn_t &instruction)
+{
+    return is_dispatch_store(instruction) || pure_dispatch_instruction(instruction);
+}
+
+bool has_reachable_compare(const dispatcher_proof_t &proof)
+{
+    for (size_t index = proof.cset_index; index > 0;)
+    {
+        --index;
+        if (proof.tail[index].insn.itype == ARM_cmp)
+            return true;
+        if (!flag_neutral(proof.tail[index].insn))
+            return false;
+    }
+    return false;
+}
+
+// The ARM decoder can fold an immediate move and its MOVK into a single
+// eight-byte instruction, so a kept instruction does not always occupy one
+// word of the slot.
+size_t instruction_words(const native_insn_t &item)
+{
+    const size_t bytes = item.insn.size > 0 ? static_cast<size_t>(item.insn.size) : size_t(4);
+    return std::max<size_t>(1, (bytes + 3) / 4);
+}
+
 bool patch_compact_dispatcher(const dispatcher_proof_t &proof)
 {
     const auto branch = chernobog::arm64_branch::decode_indirect(get_dword(proof.branch_ea));
     if (!branch || branch->authenticated)
-        return false;
-    if (proof.cset_index == 0 || proof.tail[proof.cset_index - 1].insn.itype != ARM_cmp)
     {
+        cfg_debug(proof.function_ea, "terminal branch is not a plain indirect branch");
+        return false;
+    }
+    if (proof.cset_index == 0 || !has_reachable_compare(proof))
+    {
+        cfg_debug(proof.function_ea, "no reachable flag-setting compare before the index select");
         return false;
     }
 
-    size_t patch_index = proof.cset_index + 1;
-    if (patch_index >= proof.tail.size())
-        return false;
-    const insn_t &possible_store = proof.tail[patch_index].insn;
-    const int x19 = str2reg("X19");
-    const int x29 = str2reg("X29");
-    if ((possible_store.itype == ARM_str || possible_store.itype == ARM_stur) &&
-        possible_store.Op1.type == o_reg && possible_store.Op1.reg == proof.index_reg &&
-        (possible_store.Op2.type == o_displ || possible_store.Op2.type == o_phrase) &&
-        is_state_base(possible_store.Op2.reg, x19, x29))
+    const size_t patch_index = proof.cset_index + 1;
+    if (patch_index + 1 >= proof.tail.size())
     {
-        ++patch_index;
-    }
-    if (patch_index >= proof.tail.size() - 1)
+        cfg_debug(proof.function_ea, "no instruction follows the index select");
         return false;
+    }
 
     const ea_t patch_start = proof.tail[patch_index].ea;
     const asize_t region_size = proof.branch_ea + 4 - patch_start;
     if (region_size < 12 || (region_size & 3U) != 0)
-        return false;
-
-    for (size_t index = patch_index; index + 1 < proof.tail.size(); ++index)
     {
-        if (!patchable_dispatch_instruction(proof.tail[index].insn) ||
-            has_external_incoming_edge(proof.tail[index].ea, proof.cset_ea, proof.branch_ea))
+        cfg_debug(proof.function_ea, "dispatch region is smaller than three instructions");
+        return false;
+    }
+
+    // The tail between the index selection and the indirect branch mixes the
+    // target computation with stores and hoisted values that also run on both
+    // paths. Those are kept in their original order; only the target
+    // computation is replaced, and the kept instructions must fit in front of
+    // the three branch instructions.
+    const size_t region_instructions = proof.tail.size() - 1 - patch_index;
+    enum role_t
+    {
+        ROLE_DROP,
+        ROLE_KEEP,
+        ROLE_REJECT
+    };
+    std::vector<role_t> roles(region_instructions, ROLE_DROP);
+    std::vector<std::vector<int>> uses(region_instructions);
+    const std::set<ea_t> chain = target_chain(proof, patch_index);
+    for (size_t index = 0; index < region_instructions; ++index)
+    {
+        const native_insn_t &item = proof.tail[patch_index + index];
+        const insn_t &instruction = item.insn;
+        if (is_dispatch_store(instruction))
         {
+            // A phrase operand hides its index register from the operand list,
+            // so the order-aware slice below cannot see that read.
+            if (instruction.Op1.type == o_phrase || instruction.Op2.type == o_phrase ||
+                instruction.Op3.type == o_phrase)
+            {
+                roles[index] = ROLE_REJECT;
+                continue;
+            }
+            roles[index] = ROLE_KEEP;
+            register_operands(instruction, nullptr, &uses[index]);
+        }
+        else if (is_pc_relative(instruction))
+        {
+            roles[index] = pure_dispatch_instruction(instruction) ? ROLE_KEEP : ROLE_REJECT;
+        }
+        else if (chain.count(item.ea) != 0)
+        {
+            roles[index] = ROLE_DROP;
+        }
+        else if (pure_dispatch_instruction(instruction))
+        {
+            roles[index] = ROLE_KEEP;
+            register_operands(instruction, nullptr, &uses[index]);
+        }
+        else
+        {
+            roles[index] = ROLE_REJECT;
+        }
+    }
+    for (size_t index = 0; index < region_instructions; ++index)
+    {
+        if (roles[index] == ROLE_REJECT)
+        {
+            qstring reason;
+            reason.sprnt("tail instruction %a itype=%d is neither a store nor pure dispatch",
+                         proof.tail[patch_index + index].ea,
+                         proof.tail[patch_index + index].insn.itype);
+            cfg_debug(proof.function_ea, reason.c_str());
+            return false;
+        }
+        if (has_external_incoming_edge(proof.tail[patch_index + index].ea, proof.cset_ea,
+                                       proof.branch_ea))
+        {
+            cfg_debug(proof.function_ea, "tail instruction has an external incoming edge");
             return false;
         }
     }
 
-    const std::optional<uint32_t> conditional =
-        chernobog::arm64_branch::encode_b_cond(patch_start, patch_start + 8, proof.condition ^ 1U);
-    const std::optional<uint32_t> true_branch =
-        chernobog::arm64_branch::encode_b(patch_start + 4, proof.targets[1]);
-    const std::optional<uint32_t> false_branch =
-        chernobog::arm64_branch::encode_b(patch_start + 8, proof.targets[0]);
-    if (!conditional || !true_branch || !false_branch)
+    // Promote a definition into the kept prefix when a kept store reads it.
+    for (size_t pass = 0; pass <= region_instructions; ++pass)
+    {
+        bool changed = false;
+        for (size_t index = 0; index < region_instructions; ++index)
+        {
+            if (roles[index] != ROLE_KEEP)
+                continue;
+            for (int reg : uses[index])
+            {
+                const int definition =
+                    find_previous_definition(proof.tail, patch_index + index, reg);
+                if (definition < static_cast<int>(patch_index))
+                    continue;
+                const size_t at = static_cast<size_t>(definition) - patch_index;
+                if (roles[at] == ROLE_DROP)
+                {
+                    roles[at] = ROLE_KEEP;
+                    register_operands(proof.tail[patch_index + at].insn, nullptr, &uses[at]);
+                    changed = true;
+                }
+            }
+        }
+        if (!changed)
+            break;
+    }
+
+    size_t kept_words = 0;
+    for (size_t index = 0; index < region_instructions; ++index)
+    {
+        if (roles[index] == ROLE_KEEP)
+            kept_words += instruction_words(proof.tail[patch_index + index]);
+    }
+    const size_t region_words = region_size / 4;
+    if (kept_words + 3 > region_words)
+    {
+        cfg_debug(proof.function_ea, "tail has no room for the kept stores and branches");
         return false;
+    }
+
+    const ea_t condition_ea = patch_start + ea_t(kept_words * 4);
+    const std::optional<uint32_t> conditional = chernobog::arm64_branch::encode_b_cond(
+        condition_ea, condition_ea + 8, proof.condition ^ 1U);
+    const std::optional<uint32_t> true_branch =
+        chernobog::arm64_branch::encode_b(condition_ea + 4, proof.targets[1]);
+    const std::optional<uint32_t> false_branch =
+        chernobog::arm64_branch::encode_b(condition_ea + 8, proof.targets[0]);
+    if (!conditional || !true_branch || !false_branch)
+    {
+        cfg_debug(proof.function_ea, "dispatch targets are out of branch range from the new slot");
+        return false;
+    }
+
+    std::vector<uint32_t> emitted;
+    emitted.reserve(region_words);
+    for (size_t index = 0; index < region_instructions; ++index)
+    {
+        if (roles[index] != ROLE_KEEP)
+            continue;
+        const native_insn_t &kept = proof.tail[patch_index + index];
+        const size_t words = instruction_words(kept);
+        uint32_t first = get_dword(kept.ea);
+        if (is_pc_relative(kept.insn))
+        {
+            const std::optional<uint32_t> relocated =
+                relocate_pc_relative(kept.insn, kept.ea, patch_start + ea_t(emitted.size() * 4));
+            if (!relocated)
+            {
+                cfg_debug(proof.function_ea, "kept PC-relative value cannot reach its new slot");
+                return false;
+            }
+            if (deobf::debug_enabled())
+            {
+                cfg_log("relocate function=%a from=%a to=%a old=%08X new=%08X rd=%d\n",
+                        proof.function_ea, kept.ea, patch_start + ea_t(emitted.size() * 4),
+                        get_dword(kept.ea), *relocated, kept.insn.Op1.reg);
+            }
+            first = *relocated;
+        }
+        emitted.push_back(first);
+        // The decoder folds an immediate move and its MOVK into one
+        // instruction; every word of it must move to the new slot.
+        for (size_t word = 1; word < words; ++word)
+            emitted.push_back(get_dword(kept.ea + ea_t(word * 4)));
+    }
+    emitted.push_back(*conditional);
+    emitted.push_back(*true_branch);
+    emitted.push_back(*false_branch);
 
     if (!del_items(patch_start, DELIT_SIMPLE, region_size))
+    {
+        cfg_debug(proof.function_ea, "cannot undefine the dispatch region");
         return false;
+    }
     for (ea_t ea = patch_start; ea <= proof.branch_ea; ea += 4)
         patch_dword(ea, ARM64_NOP);
-    patch_dword(patch_start, *conditional);
-    patch_dword(patch_start + 4, *true_branch);
-    patch_dword(patch_start + 8, *false_branch);
-    for (ea_t ea = patch_start; ea <= proof.branch_ea; ea += 4)
+    for (size_t index = 0; index < emitted.size(); ++index)
+        patch_dword(patch_start + ea_t(index * 4), emitted[index]);
+    for (ea_t ea = patch_start; ea <= proof.branch_ea;)
     {
-        if (create_insn(ea) <= 0)
+        const int size = create_insn(ea);
+        if (size <= 0)
+        {
+            cfg_debug(proof.function_ea, "cannot recreate the rewritten instructions");
             return false;
+        }
+        ea += ea_t(size);
     }
     if (!set_func_end(proof.function_ea, proof.function_end))
+    {
+        cfg_debug(proof.function_ea, "cannot restore the function end");
         return false;
+    }
 
-    add_cref(patch_start, patch_start + 8, fl_JN);
-    add_cref(patch_start + 4, proof.targets[1], fl_JN);
-    add_cref(patch_start + 8, proof.targets[0], fl_JN);
+    add_cref(condition_ea, condition_ea + 8, fl_JN);
+    add_cref(condition_ea + 4, proof.targets[1], fl_JN);
+    add_cref(condition_ea + 8, proof.targets[0], fl_JN);
     qstring comment;
     comment.sprnt("DEOBF: reversible Hikari dispatch rewrite; %s->%a, else->%a",
                   condition_name(proof.condition), proof.targets[1], proof.targets[0]);
-    set_cmt(patch_start, comment.c_str(), false);
+    set_cmt(condition_ea, comment.c_str(), false);
     plan_range(patch_start, proof.branch_ea + 4);
+    if (deobf::debug_enabled())
+    {
+        cfg_log("patch function=%a start=%a words=%zu region=%zu condition=%s "
+                "table=%a target0=%a target1=%a\n",
+                proof.function_ea, patch_start, emitted.size(), region_words,
+                condition_name(proof.condition), proof.table, proof.targets[0], proof.targets[1]);
+    }
     return true;
 }
 
